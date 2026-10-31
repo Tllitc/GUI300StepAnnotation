@@ -1,0 +1,11 @@
+# 四端（Windows / Android / iOS / macOS）公共依赖
+PyQt5>=5.15
+
+# 仅 macos端 使用（全局快捷键监听，见 macos端/main.py）
+pynput>=1.7
+
+# 单元测试
+pytest>=7.0
+
+# 打包发布（build_release.py）
+pyinstaller>=5.0
