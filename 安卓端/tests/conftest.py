@@ -141,6 +141,9 @@ def editor_factory(tmp_path, qapp, modal):
             init_window=None,
         )
         editor.screen_capture = FakeAndroidScreenCapture()
+        # 助手函数（helpers.walk_rounds / finish_task 等）借此临时调整模态应答；
+        # modal 是 function 级单例，同一测试内所有编辑器共享同一应答策略。
+        editor._test_modal = modal
         if auto_init:
             editor.initialize_task()
         editors.append(editor)

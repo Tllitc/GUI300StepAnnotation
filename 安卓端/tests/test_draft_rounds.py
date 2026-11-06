@@ -176,6 +176,10 @@ def test_7_3_round_boundary_state_undo_delete(editor_factory, modal):
 
     undo_step 在 steps_data 为空时应直接返回无副作用；
     delete_current_step 无当前步应提示后返回；两者均不得触碰历史轮数据。
+
+    本用例同时是 B20a（轮次折叠）的回归：草稿 steps_data 必须为空、续采必须
+    追问新指令。阶段 2.1 修复后由 xfail 转正（落轮时消费掉 steps_data，
+    草稿不再从 rounds[-1] 重建）。
     """
     modal.input_ok = False   # answer 后取消新轮指令输入 → 走 from_answer 取消分支
     editor = editor_factory()

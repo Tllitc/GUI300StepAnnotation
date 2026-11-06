@@ -223,6 +223,63 @@ class ScreenshotCanvas(QFrame):
         self.update()
 
 
+class ReLabelDialog(QDialog):
+    """「在原图上重新拉框」弹窗：编辑已完成任务时直接在磁盘原截图上重画标注框。
+
+    复用 ScreenshotCanvas 的拖框 / 原图像素反算能力；只调用 set_pixmap 而**绝不调用**
+    restore_vertices，因此打开即干净背景（不叠加旧框），落实「直接清空旧框」的交互约定。
+    """
+
+    rect_confirmed = pyqtSignal(int, int, int, int)  # left, top, right, bottom（原图像素）
+
+    def __init__(self, pixmap, parent=None):
+        # 不设 WA_DeleteOnClose：父窗口持有引用，取消/确认路径都能安全访问
+        super().__init__(parent)
+        self.setWindowTitle("在原图上重新拉框")
+        self.setModal(False)
+        self.resize(560, 720)
+        self._rect = None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "拖拽新框替换原标注框；[应用新框] 生效，[取消]/Esc 保留原框。\n"
+            "提示：可重复拖框，以最后一次为准。"
+        ))
+        self.canvas = ScreenshotCanvas()
+        self.canvas.rect_drawn.connect(self._on_rect)
+        layout.addWidget(self.canvas)
+
+        self.hint_label = QLabel("")
+        self.hint_label.setStyleSheet("color: #d93025;")
+        layout.addWidget(self.hint_label)
+
+        row = QHBoxLayout()
+        btn_apply = QPushButton("应用新框")
+        btn_apply.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
+        btn_apply.clicked.connect(self.apply)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        row.addStretch()
+        row.addWidget(btn_apply)
+        row.addWidget(btn_cancel)
+        layout.addLayout(row)
+
+        # 只喂背景图：ScreenshotCanvas.set_pixmap 内部已清空 _saved_rect/_current_rect
+        self.canvas.set_pixmap(pixmap)
+
+    def _on_rect(self, left, top, right, bottom):
+        self._rect = (left, top, right, bottom)
+        self.hint_label.setText("")
+
+    def apply(self):
+        """无新框时不关闭，等用户拖出一个框；有框则发 rect_confirmed 并 accept"""
+        if self._rect is None:
+            self.hint_label.setText("请先在原图上拖出一个新框，再点[应用新框]")
+            return
+        self.rect_confirmed.emit(*self._rect)
+        self.accept()
+
+
 def action_cn_name(action_en):
     """根据动作英文 key 反查中文名"""
     for value, label in IOS_ACTIONS:
@@ -698,8 +755,16 @@ class AnnotationEditor(QMainWindow):
         # 截图进行中标记（防止重复触发）
         self._screenshot_in_progress = False
 
+        # B2 轮次切换门闩：answer 落轮后用 singleShot(300) 延后弹新轮对话框。这 300ms 内
+        # steps_data 仍然完整、task_instruction 还是旧指令，再确认一次 answer 就会用同一
+        # 条指令往 rounds 重复 append 一轮。置 True 期间所有采集/编辑入口一律早退。
+        self._round_transition_pending = False
+
         # 当前步截图文件在磁盘上丢失（历史步恢复加载失败）：判缺、提示重截图
         self._screenshot_missing = False
+
+        # 「在原图上重新拉框」弹窗引用（编辑已完成任务专用，普通采标不创建）
+        self._relabel_dialog = None
 
         # 切到 terminate 前的 intent 备份：切走 terminate 时还原，避免污染其它步
         self._terminate_intent_saved = False
@@ -790,6 +855,15 @@ class AnnotationEditor(QMainWindow):
         )
         self.btn_insert.clicked.connect(self.start_insert_capture)
         toolbar.addWidget(self.btn_insert)
+
+        # 编辑已完成任务时可见：不重新截图，直接在磁盘原图上重新拖框
+        self.btn_relabel = QPushButton("在原图上重新拉框")
+        self.btn_relabel.setStyleSheet(
+            "QPushButton { background-color: #9C27B0; color: white; padding: 6px 12px; font-weight: bold; }"
+        )
+        self.btn_relabel.clicked.connect(self.relabel_current_step)
+        self.btn_relabel.hide()
+        toolbar.addWidget(self.btn_relabel)
 
         self.btn_screenshot = QPushButton("截图 (Ctrl+Q)")
         self.btn_screenshot.setStyleSheet(
@@ -1135,6 +1209,10 @@ class AnnotationEditor(QMainWindow):
 
     def start_insert_capture(self):
         """工具栏入口：在当前步之后插入一个新截图步骤"""
+        # B2：门闩必须在设置插入锚点之前早退，否则残留锚点会把下一次普通截图误判为插入
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
         if self.gui_dir is None:
             QMessageBox.warning(self, "提示", "请先初始化任务目录")
             return
@@ -1156,6 +1234,9 @@ class AnnotationEditor(QMainWindow):
 
     def take_screenshot(self):
         """截取 iOS 屏幕（如同一步骤已有截图则替换）"""
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
         if self._screenshot_in_progress:
             return  # 上一次截图尚未完成，忽略重复触发
 
@@ -1194,6 +1275,8 @@ class AnnotationEditor(QMainWindow):
             tempfile.gettempdir(),
             f"ios_capture_tmp_{os.getpid()}_{time.monotonic_ns()}.png",
         )
+        # B44：唯一名临时文件在下一次截图后即失去所有引用，记下上一张以便回收
+        prev_tmp_path = self._last_capture_tmp_path
         self._last_capture_tmp_path = tmp_path
 
         success, filepath = self.screen_capture.capture(tmp_path)
@@ -1206,8 +1289,10 @@ class AnnotationEditor(QMainWindow):
                 # 更新截图信息
                 self.screenshot_name_label.setText(os.path.basename(filepath))
                 self.screenshot_size_label.setText(f"{pixmap.width()} x {pixmap.height()}")
-                # 以实际截图分辨率回写 screen_info，确保写入 JSON 的屏幕尺寸与截图一致
-                if isinstance(self.screen_info, dict):
+                # B23：顶层 screen_size 只由「本轮首张追加截图」定版；重截、中间插入、
+                # 历史步覆盖都不得覆写，否则会话中一次分辨率抖动会改写整轮交付尺寸
+                if (not self.steps_data and self._capture_insert_after is None
+                        and isinstance(self.screen_info, dict)):
                     self.screen_info["screen_size"] = [pixmap.width(), pixmap.height()]
                 # 立即保存截图到 gui 目录（参考 macOS 版做法）
                 if self._replacing_screenshot:
@@ -1320,10 +1405,25 @@ class AnnotationEditor(QMainWindow):
                         )
                         self._screenshot_missing = False
                         self.status_label.setText("截图完成 - 请在图片上拉框标注目标区域，然后填写动作信息")
+                else:
+                    # 保存被拒（非法文件名）或写盘失败：原地覆盖模式下旧图未被破坏，
+                    # 不能静默无反应，否则用户以为重截已生效
+                    self.status_label.setText("截图保存失败 - 请检查存储目录后重试")
             else:
                 self.status_label.setText("截图加载失败")
         else:
             self.status_label.setText("截图失败 - 请检查 iPhone 连接（ios list 验证）")
+
+        # B44 回归：回收上一张截图遗留的临时文件，避免长会话在临时目录逐张净增。
+        # 本次截图的临时路径仍被 screenshot_cache 引用（swipe/scroll 测量依赖），
+        # 保留不动；截图失败时缓存未推进，旧临时文件同样不删。
+        keep_paths = {self.screenshot_cache, self._current_screenshot_filepath}
+        if prev_tmp_path and prev_tmp_path not in keep_paths:
+            try:
+                if os.path.isfile(prev_tmp_path):
+                    os.remove(prev_tmp_path)
+            except OSError:
+                pass
 
         # 无论成功与否都复位标记，避免失败后状态残留影响后续步骤
         self._replacing_screenshot = False
@@ -1332,17 +1432,63 @@ class AnnotationEditor(QMainWindow):
 
     def _delete_old_screenshot(self):
         """删除当前步骤的旧截图文件（如果未被其他步骤引用）"""
-        self._delete_file_if_unreferenced(self._current_screenshot_filepath)
+        self._delete_file_if_unreferenced(
+            self._current_screenshot_filepath, ignore_current=True
+        )
 
-    def _delete_file_if_unreferenced(self, path):
-        """删除指定截图文件（仅当其未被其他步骤引用时）"""
+    def _reachable_screenshot_names(self, ignore_current=False):
+        """收集仍被引用的截图文件名可达集（B16/B17 修复）
+
+        可达集 = 当前 steps_data ∪ 已落轮 rounds 的 trajectory ∪ 当前在编截图。
+        只查 steps_data 会误删已落轮仍在引用的 PNG；而编辑模式下
+        steps_data 只含被编辑的那一轮、rounds 含全部轮，其中被编辑轮在
+        rounds 内是加载时的陈旧副本，必须以 steps_data 为准，
+        否则删步永远回收不掉截图（变孤儿文件）。
+
+        :param ignore_current: 忽略「当前在编位置」的引用，即 steps_data
+            [current_step] 与 _current_screenshot_filename。删除/撤销当前步时
+            这条记录即将消失，不忽略就会「自己引用自己」，文件永远回收不掉。
+            该开关**只作用于当前在编位置**：rounds 中已落轮的引用一律完整
+            计入。曾按文件名排除（exclude_names），会把 rounds 里的同名引用
+            一并抹掉，等于废掉 B16/B17 的修复——已交付数据不得据以删盘。
+        """
+        names = set()
+        for i, step in enumerate(self.steps_data):
+            if ignore_current and i == self.current_step:
+                continue
+            fn = step.get("screenshot")
+            if fn:
+                names.add(fn)
+        edited = self._edit_round_index if self._edit_mode else None
+        for i, round_data in enumerate(self.rounds or []):
+            if i == edited or not isinstance(round_data, dict):
+                continue
+            for traj in round_data.get("trajectory") or []:
+                if not isinstance(traj, dict):
+                    continue
+                obs = traj.get("observation") or {}
+                fn = obs.get("screenshot") if isinstance(obs, dict) else None
+                if fn:
+                    names.add(fn)
+        cur = self._current_screenshot_filename
+        if cur and not ignore_current:
+            names.add(cur)
+        return names
+
+    def _delete_file_if_unreferenced(self, path, ignore_current=False):
+        """删除指定截图文件（仅当其未被任何步骤/已落轮引用时）
+
+        :param ignore_current: 见 _reachable_screenshot_names；删当前步/撤销时传 True
+        """
         if not path or not os.path.isfile(path):
             return
 
-        # 检查该文件是否被其他步骤引用
-        for i, step in enumerate(self.steps_data):
-            if i != self.current_step and step.get("screenshot_filepath") == path:
-                return  # 被其他步骤引用，不删除
+        # B16/B17 修复：可达集含 rounds 各轮 trajectory。原实现只遍历
+        # steps_data（编辑模式下只含被编辑的那一轮），会删掉
+        # 已落轮仍在引用的已交付 PNG，且无备份、不可恢复。
+        name = os.path.basename(path)
+        if name in self._reachable_screenshot_names(ignore_current=ignore_current):
+            return
 
         try:
             os.remove(path)
@@ -1528,6 +1674,72 @@ class AnnotationEditor(QMainWindow):
         self.pixels_input.clear()
         self.btn_scroll_measure.show()
         self.btn_scroll_finish.hide()
+
+    # ========== 在原图上重新拉框（编辑已完成任务） ==========
+
+    def relabel_current_step(self):
+        """编辑已完成任务：在当前步磁盘原截图上重新拖框（不重新截图、不覆盖 PNG）"""
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
+        if self._screenshot_in_progress:
+            return
+        if not self._edit_mode:
+            return
+        if self._screenshot_missing:
+            self.status_label.setText("当前步骤截图缺失，请先[截图]")
+            return
+        filename = self._current_screenshot_filename
+        pixmap = None
+        if filename and self.gui_number is not None:
+            pixmap = self.data_manager.load_screenshot(self.gui_number, filename)
+        if pixmap is None:
+            # 与 _restore_step_to_ui 同口径的磁盘回退（按完整路径直读）
+            filepath = self.screenshot_cache
+            if filepath and os.path.exists(filepath):
+                candidate = QPixmap(filepath)
+                pixmap = None if candidate.isNull() else candidate
+        if pixmap is None:
+            self.status_label.setText("截图文件缺失，请使用[截图]")
+            return
+        # 弹窗拖框走普通动作语义，先取消进行中的测量态，
+        # 避免拖出的框被当成滑动终点/滚动参照物，也避免清理额外截图时误删文件
+        self._cancel_swipe_measurement()
+        self._cancel_scroll_measurement()
+        # 取消测量会用 set_pixmap 重设主画布（附带清空已绘框），补回当前框，
+        # 保证取消弹窗时旧标注框的显示也原样保留
+        if self._valid_vertices(self._current_vertices) is not None:
+            self.canvas.restore_vertices(self._current_vertices)
+        self._relabel_dialog = ReLabelDialog(pixmap, self)
+        self._relabel_dialog.rect_confirmed.connect(self._on_relabel_rect)
+        self._relabel_dialog.show()
+
+    def _on_relabel_rect(self, left, top, right, bottom):
+        """重新拉框确认：与 on_rect_drawn 普通分支等价 + 落表 + 主画布重绘"""
+        if not (0 <= self.current_step < len(self.steps_data)):
+            return
+        vertices = [left, top, right, bottom]
+        if self._valid_vertices(vertices) is None:
+            return
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2
+        self._current_vertices = vertices
+        self.coord_x_input.setText(str(center_x))
+        self.coord_y_input.setText(str(center_y))
+        # 主预览画布立即显示新框（弹窗内已清空旧框，回到主界面也应一致）
+        self.canvas.restore_vertices(vertices)
+        suffix = ""
+        if self._swipe_start_vertices is not None or self.coord2_x_input.text():
+            suffix = "（滑动/滚动动作仅更新起点，终点保持原值）"
+        self.status_label.setText(
+            f"已在原图上重新拉框: ({left},{top})-({right},{bottom})"
+            f" | 中心点: ({center_x},{center_y}){suffix} - 请点击[保存修改]写回"
+        )
+        # 只改内存：落 steps_data（内部已失效缺项缓存）+ 重建侧栏，必须再点
+        # [保存修改] 才会写 JSON/coords，全程不碰任何图片文件
+        self._save_current_to_steps_for_edit()
+        self.sidebar.rebuild_items()
+        self._relabel_dialog = None
 
     # ========== 拉框标注 ==========
 
@@ -1734,6 +1946,11 @@ class AnnotationEditor(QMainWindow):
 
     def confirm_step(self):
         """确认当前步骤，保存并进入下一步（创建新步骤）"""
+        # B2：切轮窗口内的再次确认会用旧指令重复落轮（_save_current_round_to_list
+        # 只要 steps_data 非空就 append），直接拒绝
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
         if self._edit_mode:
             # 编辑已完成任务：只落当前步，不切轮、不结束任务、不询问新任务
             self._save_current_to_steps_for_edit()
@@ -1768,7 +1985,12 @@ class AnnotationEditor(QMainWindow):
             # 防止窗口内串步或缺项结论丢失
             self.validation_timer.stop()
             self._missing_live = None
-            self._save_current_round_to_list()
+            if not self._save_current_round_to_list():
+                # B14：缺指令且未补齐 → 本轮不落，也不能升门闩弹新轮对话框，
+                # 否则 _start_new_round 会把这条未落轮的 steps_data 直接清空
+                return
+            # 升起门闩，300ms 切轮窗口内禁止截图/确认（B2）
+            self._round_transition_pending = True
             QTimer.singleShot(300, lambda: self._start_new_round(from_answer=True))
             return
 
@@ -1782,8 +2004,31 @@ class AnnotationEditor(QMainWindow):
             self._finish_task()
             return
 
-        # 创建下一步（空步骤）
-        new_index = len(self.steps_data)
+        # 2.8（B22）：确认后游标只前进一格，不得越过末尾的待截图空位（Android 同批移植）。
+        # 原实现无条件把游标推到 len(steps_data)：回看中间某步改完确认后，用户被
+        # 静默传送到末尾，正在核对的表单也被清空，只能重新截图才能续采。
+        saved_index = self.current_step
+        total = len(self.steps_data)
+        if saved_index + 1 < total:
+            # 编辑历史步后确认：前进一格到下一已有步，现场完整回填、不清表单
+            self.current_step = saved_index + 1
+            self._restore_step_to_ui(self.steps_data[self.current_step])
+            self._update_step_label()
+            self._update_navigation_buttons()
+            self.sidebar.refresh_step_item(saved_index)
+            self.sidebar.invalidate_thumb(saved_index)
+            self.sidebar.request_thumb(saved_index, high_priority=True)
+            self.sidebar.refresh_highlight()
+            self.sidebar.ensure_current_thumb()
+            self._invalidate_missing_slot(self.current_step)
+            self.schedule_draft_save()
+            self.status_label.setText(
+                f"已更新第 {saved_index + 1} 步，步骤 {self.current_step} - 可继续编辑"
+            )
+            return
+
+        # 追加新步/确认末步：创建末尾待截图空位（原行为）
+        new_index = total
         self.current_step = new_index
         self._reset_for_next_step()
         # 300+ 步场景下增量追加条目，避免全量重建（首次确认时列表为空也必须创建）。
@@ -1809,6 +2054,10 @@ class AnnotationEditor(QMainWindow):
 
     def undo_last_step(self):
         """撤销上一步：删除当前步骤数据并回到上一步（复用删除流程）"""
+        # B2：切轮窗口内不得删改已落轮的数据
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
         if not self.steps_data:
             QMessageBox.information(self, "提示", "没有可撤销的步骤")
             return
@@ -1871,6 +2120,9 @@ class AnnotationEditor(QMainWindow):
 
     def delete_current_step(self, confirm_dialog=True):
         """删除当前步骤：删 steps_data 记录与截图文件，后一步回填表单"""
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
         index = self.current_step
         if not (0 <= index < len(self.steps_data)):
             # current_step == len(steps_data) 且已截图：在采未确认的新步。
@@ -1886,19 +2138,10 @@ class AnnotationEditor(QMainWindow):
             self._cancel_swipe_measurement()
             self._cancel_scroll_measurement()
 
-            # 2. 失效缩略图缓存，并按剩余引用回收 pending 截图文件
+            # 2. 失效缩略图缓存，并按引用可达集回收 pending 截图文件（B16/B17）
+            #    pending 就是 _current_screenshot_filename，须按位置忽略它自己
             self.sidebar.remove_thumb_cache_by_filename(pending_filename)
-            if pending_path:
-                referenced = any(
-                    s.get("screenshot_filepath") == pending_path
-                    for s in self.steps_data
-                )
-                if not referenced:
-                    try:
-                        if os.path.isfile(pending_path):
-                            os.remove(pending_path)
-                    except Exception as e:
-                        print(f"删除未确认截图失败: {e}")
+            self._delete_file_if_unreferenced(pending_path, ignore_current=True)
 
             # 3. 回到最后已确认步（直接恢复 UI，不落表、不导航）；删空则回初始态
             if self.steps_data:
@@ -1933,19 +2176,14 @@ class AnnotationEditor(QMainWindow):
         path = step.get("screenshot_filepath") or ""
         filename = step.get("screenshot") or ""
 
-        # 先从列表移除，再按剩余引用决定是否删盘（容忍文件缺失）
+        # B16/B17 修复：删盘判定须在移除步骤之前做。此刻 current_step==index
+        # 精确指向被删步，ignore_current 按位置忽略它自己；若先 del 再判定，
+        # index 会落到「原下一步」，位置忽略将误把幸存步排除出可达集。
+        # 只比对 steps_data 会误删已落轮 rounds 仍在引用的已交付 PNG，故可达集
+        # 含 rounds 各轮 trajectory；_current_screenshot_filename 此刻亦仍指向被删步。
+        self._delete_file_if_unreferenced(path, ignore_current=True)
         del self.steps_data[index]
         self.sidebar.remove_thumb_cache_by_filename(filename)
-        if path:
-            referenced = any(
-                s.get("screenshot_filepath") == path for s in self.steps_data
-            )
-            if not referenced:
-                try:
-                    if path and os.path.isfile(path):
-                        os.remove(path)
-                except Exception as e:
-                    print(f"删除步骤截图失败: {e}")
 
         # 定位到删除后应停留的步骤
         if self.steps_data:
@@ -1958,6 +2196,12 @@ class AnnotationEditor(QMainWindow):
             self._reset_for_next_step()
 
         self._cancel_swipe_measurement()
+        # 5.8（B45）防御式成对取消：删步后无论走哪条分支都必须退出 scroll 长滑
+        # 测量态。注：本端两条分支都会先调 _clear_inputs()（_restore_step_to_ui:1728 /
+        # _reset_for_next_step:2845），而 _clear_inputs 已自带 swipe+scroll 取消，
+        # 故此行在 iOS 上不可单独观测（写变异用例会是假绿）；保留它是为了
+        # 与 Android/Windows 同名分支保持口径一致，并防止日后有人拆掉 _clear_inputs。
+        self._cancel_scroll_measurement()
         self._update_step_label()
         self._update_navigation_buttons()
         self.sidebar.rebuild_items()
@@ -2212,6 +2456,11 @@ class AnnotationEditor(QMainWindow):
             serializable_steps.append(self._serialize_step(self._collect_step_data()))
 
         if not serializable_steps and not self.rounds:
+            # 5.1（B37）空现场（撤销/删除清空全部步骤）必须删掉磁盘上的残留草稿，
+            # 只 return 会让已删步骤在下次续采 load_from_draft 时整批复活。
+            # 口径对齐 Android _write_draft_now 的同名分支。
+            self.data_manager.delete_draft(self.gui_number)
+            self.sidebar.set_draft_saved()
             return
 
         draft = {
@@ -2490,6 +2739,7 @@ class AnnotationEditor(QMainWindow):
 
         if hasattr(self, "btn_save_edit"):
             self.btn_save_edit.show()
+        self.btn_relabel.show()
 
         self.setWindowTitle(
             f"GUI长步骤采标工具-iOS - {self.app_name}（编辑已完成任务）"
@@ -2639,18 +2889,39 @@ class AnnotationEditor(QMainWindow):
         if round_index < len(self._coords_rounds):
             self._coords_rounds[round_index] = copy.deepcopy(coords)
 
-        # 以原 JSON 为基底重建 messages，顶层字段原样保留
+        # 1.5（B40）原地只改被编辑轮对应的两条消息，其余消息对象一律不动。
+        # 早前先 deepcopy 再按 self.rounds 全量重建，会把原 JSON 里非
+        # user/assistant 的消息、每轮消息自带的其他字段、末尾孤立 user 消息
+        # 整条丢掉——已交付数据不可恢复。结构不满足「严格交替」时
+        # 拒绝写回，绝不退化成全量重建。
         data = copy.deepcopy(self._completed_json or {})
-        data["messages"] = []
-        for round_item in self.rounds:
-            data["messages"].append({
-                "role": "user",
-                "instruction": round_item.get("instruction", ""),
-            })
-            data["messages"].append({
-                "role": "assistant",
-                "trajectory": round_item.get("trajectory") or [],
-            })
+        messages = data.get("messages")
+        anchor = 2 * round_index + 1
+        if (not isinstance(messages, list) or len(messages) <= anchor
+                or not isinstance(messages[2 * round_index], dict)
+                or not isinstance(messages[anchor], dict)
+                or messages[2 * round_index].get("role") != "user"
+                or messages[anchor].get("role") != "assistant"):
+            reason = (
+                f"最终 JSON 的 messages 结构与轮次不匹配：第 {round_index + 1} 轮需要 "
+                f"messages[{2 * round_index}]=user / messages[{anchor}]=assistant"
+            )
+            if silent:
+                print(f"编辑保存中止（gui_{self.gui_number}）：{reason}")
+            else:
+                QMessageBox.critical(
+                    self, "保存失败", reason + "\n已拒绝写回，原文件保持不变"
+                )
+            return False
+
+        edited_round = self.rounds[round_index]
+        messages[2 * round_index]["instruction"] = edited_round.get("instruction", "")
+        messages[anchor]["trajectory"] = edited_round.get("trajectory") or []
+        data["messages"] = messages
+
+        # 1.4 安全网：编辑写回会整份替换已交付 JSON，先把原文件留一份 .bak（覆盖式）。
+        # 仅在原文件存在时生成；备份失败不阻断保存。
+        self.data_manager.backup_final_json(self.gui_number)
 
         saved_path = self.data_manager.save_json_data(data, self.gui_number)
         if not saved_path:
@@ -2668,8 +2939,16 @@ class AnnotationEditor(QMainWindow):
                 item = copy.deepcopy(coord)
                 item["round"] = r_idx
                 all_coords.append(item)
-        if all_coords or self._original_coords_exist:
+        # 1.5（B41）coords 只在真的收集到条目时才写盘。旧条件带了
+        # or self._original_coords_exist，会在「本轮导出 0 条坐标」时用空数组
+        # 覆盖已交付的坐标文件；现在改为告警并跳过写入，保留原文件。
+        if all_coords:
             self.data_manager.save_coords_json(all_coords, self.gui_number)
+        elif self._original_coords_exist:
+            print(
+                f"警告：编辑写回收集到 0 条坐标，已跳过 coords 写入以保留原文件"
+                f"（gui_{self.gui_number}）"
+            )
 
         self._draft_discarded = True
         self.draft_timer.stop()
@@ -2909,14 +3188,33 @@ class AnnotationEditor(QMainWindow):
                     action_label = action_cn_name(action_data.get("action", ""))
                 missing_list.append((i, action_label, reasons))
         if missing_list:
+            # DI-18：上面的 _save_current_to_steps 可能刚 append 出新步，而拒收分支
+            # 不重建侧栏 → 条目数落后于 steps_data、缺填标记停在旧步骤集合上。
+            # 弹清单前先全量重建，保证界面与模型一致
+            self.sidebar.rebuild_items()
             self._show_validation_fail_dialog(missing_list)
             return
 
         # 保存当前轮次到列表
-        self._save_current_round_to_list()
+        if not self._save_current_round_to_list():
+            # B14：缺指令被拒绝落轮 → 中止收尾，不写出缺最后一轮的交付文件
+            QMessageBox.warning(
+                self, "缺少任务指令",
+                "当前轮次还没有任务指令，已中止保存以免轨迹挂到错误指令上。\n"
+                "请重新确认本步并输入本轮指令后再完成标注。"
+            )
+            return
 
         # 合并所有轮次写入文件
-        self._save_all_rounds_to_file()
+        # 5.7（B31）落盘失败绝不能继续弹"已保存"：用户会以为数据已交付而清场，
+        # 实际只剩草稿（甚至草稿也没了）却无人知晓。失败即中止并明确报错。
+        if not self._save_all_rounds_to_file():
+            QMessageBox.critical(
+                self, "保存失败",
+                f"本轮数据未能写入 gui_{self.gui_number}/，草稿已保留，"
+                "请重新打开工具续采后再完成一次。"
+            )
+            return
 
         # 询问是否继续新任务
         reply = QMessageBox.question(
@@ -2931,10 +3229,38 @@ class AnnotationEditor(QMainWindow):
         else:
             self.close()
 
-    def _save_current_round_to_list(self):
-        """将当前轮次保存到 rounds 列表（不写磁盘，参考 macOS save_current_round）"""
+    def _prompt_missing_instruction(self):
+        """本轮缺少任务指令时弹窗补齐；返回 False 表示用户仍未给出指令。
+
+        B14：取消新轮后 task_instruction 被置空（见 _reset_workspace_after_cancel）。
+        放任空指令落轮的话，新一轮轨迹会静默挂到上一轮的旧指令上，事后无从
+        分辨哪段轨迹属于哪条指令，因此落轮前必须显式补齐，补齐失败由调用方拒绝落轮。
+        """
+        new_instruction, ok = QInputDialog.getText(
+            self,
+            "任务指令",
+            f"【{self.app_name}】当前轮次缺少任务指令，请输入本轮对应的指令：",
+            QLineEdit.Normal,
+            ""
+        )
+        if ok and new_instruction.strip():
+            self.task_instruction = new_instruction.strip()
+            return True
+        self.status_label.setText("缺少任务指令 - 本轮未落轮，请补齐指令后重新确认")
+        return False
+
+    def _save_current_round_to_list(self, prompt_instruction=True):
+        """将当前轮次保存到 rounds 列表（不写磁盘，参考 macOS save_current_round）
+
+        :param prompt_instruction: 指令缺失时是否弹窗补齐；无人值守路径传 False 静默拒绝
+        :return: True 表示已落轮或本轮无步骤可落；False 表示因缺少任务指令被拒绝落轮，
+            调用方必须保持 steps_data 原样并中止后续的切轮/写盘动作
+        """
         if not self.steps_data:
-            return  # 无步骤数据，避免重复写入
+            return True  # 无步骤数据，避免重复写入；不构成拒绝
+        if not (self.task_instruction or "").strip():
+            if not prompt_instruction or not self._prompt_missing_instruction():
+                return False
 
         trajectory = []
         all_coords = []
@@ -2950,7 +3276,12 @@ class AnnotationEditor(QMainWindow):
                     "active_window": "",
                     "ui_tree_segment": ""
                 },
-                "actions": [action_data]
+                # 2.7（B42）落轮必须存 action 的深拷贝：直接把 steps_data 里的活对象
+                # 塞进 rounds，会让 rounds 与本轮数据共享同一个 dict，任何对步骤
+                # action 的原地改写（含嵌套的 coordinate 列表）都会回写到已落轮、
+                # 甚至已交付的轮次上。coords 侧无需再包：_build_coords_entry 内的
+                # vertices 由 _valid_vertices 返回 list() 副本，且只读 action_data。
+                "actions": [copy.deepcopy(action_data)]
             })
             coords_entry = self._build_coords_entry(action_data, step_data.get("vertices"))
             coords_entry["step"] = i
@@ -2977,11 +3308,15 @@ class AnnotationEditor(QMainWindow):
         self.validation_timer.stop()
         self.sidebar.rebuild_items()
         self._write_draft_now()
+        return True
 
     def _save_all_rounds_to_file(self):
-        """合并所有轮次，写入 JSON 和 coords JSON 文件"""
+        """合并所有轮次，写入 JSON 和 coords JSON 文件
+
+        :return: True 表示交付 JSON 已成功落盘；False 表示无可保存数据或写盘失败
+        """
         if not self.rounds:
-            return
+            return False
 
         # 使用第一轮的 instruction 作为占位
         json_data = self.data_manager.create_initial_json_structure(
@@ -3008,18 +3343,42 @@ class AnnotationEditor(QMainWindow):
                 all_coords.append(coord)
 
         saved_path = self.data_manager.save_json_data(json_data, self.gui_number)
-        if saved_path:
-            # 主数据落盘成功后删除草稿；coords 仍按既有契约非空才保存
-            if all_coords:
-                self.data_manager.save_coords_json(all_coords, self.gui_number)
-            self.data_manager.delete_draft(self.gui_number)
-            self._draft_discarded = True
-            self.draft_timer.stop()
+        if not saved_path:
+            # 5.7（B31）写盘失败：草稿与定时器原样保留（下次开屏仍可续采），
+            # 由调用方据返回值决定是否谎报"已保存"
+            return False
+        # 主数据落盘成功后删除草稿；coords 仍按既有契约非空才保存
+        if all_coords:
+            self.data_manager.save_coords_json(all_coords, self.gui_number)
+        self.data_manager.delete_draft(self.gui_number)
+        self._draft_discarded = True
+        self.draft_timer.stop()
 
         self.status_label.setText(f"所有轮次已保存到 gui_{self.gui_number}/")
+        return True
+
+    def _reset_workspace_after_cancel(self):
+        """已落轮后用户放弃开启新轮：把界面清成空白起点（口径对齐 Android 同名方法）。
+
+        _save_current_round_to_list 只消费了数据层（steps_data/coords_data/
+        current_step/截图缓存/缺填缓存）并重建侧栏、落草稿，画布上的截图、
+        表单输入、导航按钮与步骤标签仍停在上一轮；取消新轮不能只改文案，
+        否则用户看到的是上一轮残留，接着采集会把旧表单值带进新轮（B28）。
+        """
+        self.current_step = 0
+        # B14：上一轮已随 answer 落轮并被消费，取消新轮后不得继续持有旧指令，
+        # 否则用户接着采集的整轮会被静默挂到上一条指令上（落轮前另有强校验兼做安
+        # 全网，两者缺一都会重现指令错乱）。
+        self.task_instruction = ""
+        self._reset_for_next_step()
+        self.sidebar.rebuild_items()
+        self.schedule_draft_save()
+        self.status_label.setText("已取消新任务 - 可继续截图标注")
 
     def _start_new_round(self, from_answer=False):
         """开始新一轮任务（同一 gui 文件夹内，参考 macOS answer 流程）"""
+        # 门闩回调已进场，切轮窗口结束，恢复采集/编辑入口（B2）
+        self._round_transition_pending = False
         new_instruction, ok = QInputDialog.getText(
             self,
             "新任务指令",
@@ -3053,7 +3412,8 @@ class AnnotationEditor(QMainWindow):
             self.status_label.setText(f"新任务开始 - 指令: {self.task_instruction} - 请截图")
         else:
             if from_answer:
-                self.status_label.setText("已取消新任务")
+                # 2.3（B28）取消新轮走完整重置，不留下上一轮的界面残留
+                self._reset_workspace_after_cancel()
             else:
                 self.close()
 
@@ -3096,6 +3456,13 @@ class AnnotationEditor(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭时静默尝试落盘一次草稿，再回调恢复初始化界面"""
+        # 重新拉框弹窗先关闭，避免弹窗残留遮挡关闭时的自动写回
+        if getattr(self, "_relabel_dialog", None) is not None:
+            try:
+                self._relabel_dialog.close()
+            except RuntimeError:
+                pass
+            self._relabel_dialog = None
         if self._edit_mode:
             # 编辑已完成任务：不写草稿；未显式保存则把修改静默写回原文件
             if not self._final_data_saved:

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""数据一致性不变量断言（INV-1 ~ INV-10 的测试侧实现）。
+"""数据一致性不变量断言（INV-1 ~ INV-13 的测试侧实现）。
 
 这些函数只读取产品对象状态与磁盘文件，绝不修改产品数据；
 所有断言失败均以 AssertionError 抛出，并带上下文字段。
@@ -9,7 +9,9 @@
     磁盘目录: gui_{gui_number}/
 """
 
+import hashlib
 import json
+import math
 import os
 import re
 
@@ -17,6 +19,17 @@ import pytest
 
 
 SCREENSHOT_NAME_RE = re.compile(r"^gui_\d{6}_\d{4}\.png$")
+# INV-11：从截图名提取 4 位序号
+SEQ_RE = re.compile(r"^gui_\d{6}_(\d{4})\.png$")
+
+# INV-8 强断言口径：需要拉框并写入 coords 的动作全集。
+# 必须与产品 validate_step_at 的 coord_actions 完全一致（含 scroll）——
+# 产品侧 _collect_coords_entries 的 coord_action_types 目前缺 scroll（B6），
+# 阶段 4.1 修复时产品两处须共用本常量口径，杜绝再次漂移。
+COORD_ACTION_TYPES = frozenset({
+    "left_click", "double_click", "triple_click", "right_click",
+    "middle_click", "mouse_move", "left_click_drag", "type", "scroll",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -241,8 +254,16 @@ def assert_draft(editor):
 # ---------------------------------------------------------------------------
 # INV-8 最终产物一致
 # ---------------------------------------------------------------------------
-def assert_final_json(editor, expected_rounds=None):
-    """INV-8: 读取 gui_XXXXXX.json 与 gui_XXXXXX_coords.json 并做交叉校验。"""
+def assert_final_json(editor, expected_rounds=None, fullscreen_refs=None):
+    """INV-8: 读取 gui_XXXXXX.json 与 gui_XXXXXX_coords.json 并做交叉校验。
+
+    :param fullscreen_refs: 全屏截图豁免拉框的 (round_idx, step_idx) 集合。
+        产品 validate_step_at 对 selection_type == "fullscreen" 豁免坐标要求，
+        _collect_coords_entries 也因 rect_info 为空而跳过这类步骤；但最终 JSON
+        的 trajectory 条目不携带 selection_type，无法从盘上辨识，故须由调用方
+        显式声明。默认 None 表示「本用例无全屏步」，此时坐标类动作必须条条有
+        coords 条目。
+    """
     gui_dir = _gui_dir(editor)
     json_path = os.path.join(gui_dir, f"gui_{editor.gui_number}.json")
     coords_path = os.path.join(gui_dir, f"gui_{editor.gui_number}_coords.json")
@@ -312,14 +333,121 @@ def assert_final_json(editor, expected_rounds=None):
             coord_refs.append((r_idx, s_idx, actions[0].get("action", ""), shot))
             total_steps += 1
 
-    if coords is not None:
+    _fullscreen = set(fullscreen_refs or ())
+    if coords is None:
+        # 无 coords 文件却存在需要坐标的步骤 —— B6（scroll 顶点丢失）或
+        # B41（空 coords 覆盖 / 未写出）的直接证据。
+        need = [(r, s, a) for (r, s, a, _shot) in coord_refs
+                if a in COORD_ACTION_TYPES and (r, s) not in _fullscreen]
+        assert not need, (
+            f"INV-8: coords 文件缺失，但存在 {len(need)} 个需要坐标的步骤：{need}"
+        )
+    else:
         assert isinstance(coords, list), "INV-8: coords JSON 不是数组"
-        # coords 条目数 == trajectory 总步数（允许 coords 条目缺失某些 action，但一般应一致）
-        if len(coords) != total_steps:
-            # 允许 coords 条目缺失（产品只对部分动作类型收集），此处只做弱断言
-            assert len(coords) <= total_steps
+        assert len(coords) <= total_steps, (
+            f"INV-8: coords 条数 {len(coords)} 超过 trajectory 总步数 {total_steps}"
+        )
+        assert_coords_entry_structure(coords)
+        assert_coords_cover_refs(coords, coord_refs, fullscreen_refs=_fullscreen)
 
     return data, coords
+
+
+def _assert_finite_numbers(value, where, expect_len=None):
+    """断言 value 是（可选定长的）有限实数数组。"""
+    assert isinstance(value, (list, tuple)), f"INV-8: {where} 不是数组：{value!r}"
+    if expect_len is not None:
+        assert len(value) == expect_len, (
+            f"INV-8: {where} 长度应为 {expect_len}，实际 {len(value)}：{value!r}"
+        )
+    for n in value:
+        assert isinstance(n, (int, float)) and not isinstance(n, bool), (
+            f"INV-8: {where} 含非数值元素：{value!r}"
+        )
+        assert math.isfinite(n), f"INV-8: {where} 含非有限数：{value!r}"
+
+
+def assert_coords_entry_structure(coords, where="coords"):
+    """INV-8 强断言（结构层）：每个 coords 条目的键集与数值必须完整。
+
+    - 单框动作：vertices（4 个有限数）+ center（2 个有限数）
+    - left_click_drag：start_vertices/start_center/end_vertices/end_center
+    """
+    for i, entry in enumerate(coords):
+        assert isinstance(entry, dict), f"INV-8: {where}[{i}] 不是对象：{entry!r}"
+        step = entry.get("step")
+        assert isinstance(step, int) and not isinstance(step, bool), (
+            f"INV-8: {where}[{i}] step 缺失或非整数：{step!r}"
+        )
+        assert step >= 0, f"INV-8: {where}[{i}] step 为负：{step}"
+        action = entry.get("action")
+        assert isinstance(action, str) and action, (
+            f"INV-8: {where}[{i}] action 缺失或为空：{action!r}"
+        )
+        assert action in COORD_ACTION_TYPES, (
+            f"INV-8: {where}[{i}] action={action!r} 不在需要坐标的动作集合内"
+        )
+        if action == "left_click_drag":
+            for key in ("start_vertices", "end_vertices"):
+                assert key in entry, f"INV-8: {where}[{i}] 拖拽条目缺 {key}"
+                _assert_finite_numbers(entry[key], f"{where}[{i}].{key}", expect_len=4)
+            for key in ("start_center", "end_center"):
+                assert key in entry, f"INV-8: {where}[{i}] 拖拽条目缺 {key}"
+                _assert_finite_numbers(entry[key], f"{where}[{i}].{key}", expect_len=2)
+        else:
+            assert "vertices" in entry, f"INV-8: {where}[{i}] 缺 vertices"
+            _assert_finite_numbers(entry["vertices"], f"{where}[{i}].vertices", expect_len=4)
+            assert "center" in entry, f"INV-8: {where}[{i}] 缺 center"
+            _assert_finite_numbers(entry["center"], f"{where}[{i}].center", expect_len=2)
+
+
+def assert_coords_cover_refs(coords, coord_refs, fullscreen_refs=None):
+    """INV-8 强断言（覆盖层）：每个需要坐标的 (round, step) 都必须有 coords 条目。
+
+    Windows 的 coords 条目**不含 round 字段**（B4，阶段 4.2 修复），无法按
+    (round, step) 直接定位；但 all_coords_entries 是按「落轮先后 + 轮内 step
+    升序」extend 出来的，故采用有序消费匹配：依次消费期望项，在 coords 中取
+    第一个 (step, action) 相同且未被消费的条目。跨轮同名 (step, action) 因此
+    不会互相顶替。
+
+    :param coord_refs: [(round_idx, step_idx, action, screenshot), ...]
+    """
+    skip = set(fullscreen_refs or ())
+    expected = [
+        (r, s, a) for (r, s, a, _shot) in coord_refs
+        if a in COORD_ACTION_TYPES and (r, s) not in skip
+    ]
+    consumed = [False] * len(coords)
+    missing = []
+    for (r_idx, s_idx, action) in expected:
+        hit = None
+        for j, entry in enumerate(coords):
+            if consumed[j] or not isinstance(entry, dict):
+                continue
+            if entry.get("step") == s_idx and entry.get("action") == action:
+                hit = j
+                break
+        if hit is None:
+            missing.append((r_idx, s_idx, action))
+        else:
+            consumed[hit] = True
+
+    if missing:
+        hint = ""
+        if any(m[2] == "scroll" for m in missing):
+            hint = ("；其中 scroll 步缺失即 B6：_collect_coords_entries 的 "
+                    "coord_action_types 未包含 scroll，而 validate_step_at 的 "
+                    "coord_actions 包含它 —— 用户按要求拉了框，顶点却被静默丢弃"
+                    "（阶段 4.1 修复）")
+        raise AssertionError(
+            f"INV-8: {len(missing)} 个需要坐标的步骤在 coords 中无对应条目："
+            f"{missing}{hint}"
+        )
+
+    extra = [coords[j] for j in range(len(coords)) if not consumed[j]]
+    assert not extra, (
+        f"INV-8: coords 中存在 {len(extra)} 条无对应 trajectory 步骤的条目：{extra}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -349,3 +477,214 @@ def assert_transient_reset(editor):
     # 主窗口可见且完全不透明
     assert editor.windowOpacity() == 1.0, f"INV-10: windowOpacity={editor.windowOpacity()} != 1.0"
     assert editor.isVisible(), "INV-10: 主窗口不可见"
+
+
+# ---------------------------------------------------------------------------
+# INV-11 截图序号可追溯
+# ---------------------------------------------------------------------------
+def _seq_of(name):
+    m = SEQ_RE.match(name or "")
+    return int(m.group(1)) if m else None
+
+
+def assert_screenshot_order(editor, strict_monotonic=True, allow_holes=True):
+    """INV-11 截图序号：全局唯一、命名合规、（可选）无空洞、（可选）单调递增。
+
+    :param strict_monotonic: True 时断言 steps 与各轮 trajectory 的序号序列严格
+        递增，且未落轮的 steps 序号全部大于已落轮最大序号（捕获 B38：Android
+        分配「最小未占用序号」会复用被删序号，使文件名序号与 step 顺序脱钩）。
+        「插入中间步」场景天然破坏该性质（新图取磁盘 max+1 却插到中间，见 B10），
+        此类用例须显式传 False，只保留「全局唯一 + 命名合规 + 引用存在」。
+    :param allow_holes: False 时额外断言 set(nums) == set(range(1, len(nums)+1))。
+        删除中间步会留空洞，故默认允许（阶段 3.1 采纳的退化方案）。
+    """
+    gui_dir = _gui_dir(editor)
+    step_names = _step_referenced_filenames(editor.steps)
+    rounds = getattr(editor, "rounds", []) or []
+    round_name_lists = [_round_referenced_filenames([rnd]) for rnd in rounds]
+
+    all_names = list(step_names)
+    for names in round_name_lists:
+        all_names.extend(names)
+    for name in all_names:
+        assert SEQ_RE.match(name), f"INV-11: 截图命名不规范：{name}"
+        assert os.path.isfile(os.path.join(gui_dir, name)), (
+            f"INV-11: 引用的截图不存在：{name}"
+        )
+    dupes = sorted({n for n in all_names if all_names.count(n) > 1})
+    assert not dupes, f"INV-11: 截图被多个步骤重复引用：{dupes}"
+
+    nums = [n for n in (_seq_of(x) for x in all_names) if n is not None]
+    if not allow_holes and nums:
+        assert set(nums) == set(range(1, len(nums) + 1)), (
+            f"INV-11: 截图序号存在空洞或不从 1 起：{sorted(nums)}"
+        )
+
+    if not strict_monotonic:
+        return
+
+    def _assert_increasing(names, where):
+        seq = [_seq_of(n) for n in names]
+        for i in range(1, len(seq)):
+            assert seq[i] > seq[i - 1], (
+                f"INV-11: {where} 截图序号未严格递增："
+                f"{names[i - 1]} -> {names[i]}"
+            )
+
+    for r_idx, names in enumerate(round_name_lists):
+        _assert_increasing(names, f"第 {r_idx} 轮")
+    _assert_increasing(step_names, "steps")
+    saved_max = max(
+        [_seq_of(n) for names in round_name_lists for n in names] or [0]
+    )
+    step_min = min([_seq_of(n) for n in step_names] or [saved_max + 1])
+    assert step_min > saved_max, (
+        f"INV-11: 未落轮步骤序号({step_min}) 未大于已落轮最大序号({saved_max})，"
+        f"新轮复用了旧序号"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV-12 磁盘快照（编辑模式零改盘）
+# ---------------------------------------------------------------------------
+def snapshot_dir(gui_dir):
+    """目录快照：文件名 -> (size, sha256)"""
+    result = {}
+    gui_dir = str(gui_dir)
+    if not os.path.isdir(gui_dir):
+        return result
+    for name in sorted(os.listdir(gui_dir)):
+        path = os.path.join(gui_dir, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "rb") as f:
+            blob = f.read()
+        result[name] = (len(blob), hashlib.sha256(blob).hexdigest())
+    return result
+
+
+def assert_dir_unchanged(gui_dir, snapshot):
+    """INV-12 磁盘零变化：断言编辑模式下截图/删步/回退不改盘（捕获 B30/B11）。"""
+    after = snapshot_dir(gui_dir)
+    added = sorted(set(after) - set(snapshot))
+    removed = sorted(set(snapshot) - set(after))
+    changed = sorted(
+        n for n in set(snapshot) & set(after) if snapshot[n] != after[n]
+    )
+    assert not (added or removed or changed), (
+        f"INV-12: 编辑模式下磁盘发生变化：新增 {added}，删除 {removed}，"
+        f"改写 {changed}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# INV-13 编辑写回保留未编辑部分
+# ---------------------------------------------------------------------------
+def _normalize_coords(loaded):
+    """兼容两种外层结构：纯数组（Windows/iOS） / {"version":..., "coords":[...]}（Android）"""
+    if loaded is None:
+        return []
+    if isinstance(loaded, list):
+        return loaded
+    if isinstance(loaded, dict):
+        return loaded.get("coords") or []
+    return []
+
+
+def coords_by_round(coords):
+    """按轮切段：优先用显式 round 字段，缺失时按 step 变小切段。
+
+    Windows coords 不写 round（B4，阶段 4.2 修复），故必须保留 step 切段路径
+    才能对历史已交付文件做 INV-13 校验。
+    """
+    groups = {}
+    current = 0
+    prev_step = None
+    for entry in coords or []:
+        if not isinstance(entry, dict):
+            continue
+        rnd = entry.get("round")
+        step = entry.get("step")
+        if isinstance(rnd, int):
+            current = rnd
+        elif (isinstance(prev_step, int) and isinstance(step, int)
+                and step < prev_step):
+            current += 1
+        groups.setdefault(current, []).append(entry)
+        if isinstance(step, int):
+            prev_step = step
+    return groups
+
+
+def assert_edit_writeback_preserved(gui_dir, gui_number, before_data, before_coords,
+                                    edited_round_index):
+    """INV-13 编辑写回：未编辑的消息与 coords 必须逐字段保留（捕获 B40/B41）。
+
+    :param before_data: 编辑前读到的完整 gui_N.json dict
+    :param before_coords: 编辑前的 coords（list 或 {"coords": [...]} 均可）
+    :return: (after_data, after_coords)
+    """
+    gui_dir = str(gui_dir)
+    json_path = os.path.join(gui_dir, f"gui_{gui_number}.json")
+    coords_path = os.path.join(gui_dir, f"gui_{gui_number}_coords.json")
+    assert os.path.isfile(json_path), f"INV-13: 编辑写回后最终 JSON 缺失：{json_path}"
+    with open(json_path, "r", encoding="utf-8") as f:
+        after = json.load(f)
+
+    before_messages = (before_data or {}).get("messages") or []
+    after_messages = after.get("messages") or []
+    assert len(after_messages) == len(before_messages), (
+        f"INV-13: messages 条数被改写："
+        f"{len(before_messages)} -> {len(after_messages)}"
+    )
+    assert [m.get("role") for m in after_messages] == \
+           [m.get("role") for m in before_messages], "INV-13: messages 角色序列被改写"
+    touched = {2 * edited_round_index, 2 * edited_round_index + 1}
+    for i, (b, g) in enumerate(zip(before_messages, after_messages)):
+        if i in touched:
+            continue
+        assert g == b, (
+            f"INV-13: messages[{i}]（非编辑轮，role={b.get('role')!r}）被改写或丢失"
+        )
+
+    after_coords = None
+    if os.path.isfile(coords_path):
+        with open(coords_path, "r", encoding="utf-8") as f:
+            after_coords = _normalize_coords(json.load(f))
+    before_norm = _normalize_coords(before_coords)
+    if before_norm:
+        assert after_coords, "INV-13: 原 coords 非空但写回后为空（B41 空覆盖）"
+        before_groups = coords_by_round(before_norm)
+        after_groups = coords_by_round(after_coords)
+        for r_idx, entries in before_groups.items():
+            if r_idx == edited_round_index:
+                continue
+            assert after_groups.get(r_idx) == entries, (
+                f"INV-13: 未编辑轮 round={r_idx} 的 coords 条目被改写"
+            )
+    return after, after_coords
+
+
+# ---------------------------------------------------------------------------
+# 组合入口
+# ---------------------------------------------------------------------------
+def assert_all(editor, allow_orphans=False, with_draft=True):
+    """采集过程中可反复使用的全套不变量（Windows 侧组合入口，对齐 iOS/Android）。
+
+    内部会先 flush 草稿（INV-7 依赖落盘）。不含最终 JSON 断言（最终 JSON 只在
+    terminate 后产出，请用 assert_final_json）。编辑模式下请传 with_draft=False
+    （编辑态不写草稿）。
+
+    INV-11 在组合入口用 strict_monotonic=False（只保证全局唯一 + 命名合规 +
+    引用存在）：插入中间步天然破坏严格递增，严格模式留给专项用例显式调用。
+    """
+    editor._write_draft_now()
+    assert_model(editor)
+    assert_stack(editor)
+    assert_files(editor, allow_orphans=allow_orphans)
+    assert_naming(editor)
+    assert_screenshot_order(editor, strict_monotonic=False)
+    assert_sidebar(editor)
+    assert_transient_reset(editor)
+    if with_draft:
+        assert_draft(editor)

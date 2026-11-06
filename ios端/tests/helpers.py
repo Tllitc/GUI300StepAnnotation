@@ -10,7 +10,15 @@
 
     walk_steps(editor, 3, action="click")
     finish_task(editor)            # 自动答 No（不继续新任务）
+
+    from helpers import walk_rounds, open_edit_mode
+
+    walk_rounds(editor, [(3, "指令A", "click"), (2, "指令B", "click")])
 """
+
+import copy
+import os
+import re
 
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QMessageBox
@@ -52,6 +60,21 @@ def capture(editor):
     QTest.qWait(_STEP_MS)
     assert editor._current_screenshot_filename, "截图未成功：当前步骤没有截图文件名"
     return editor._current_screenshot_filename
+
+
+def distinct_capture_seed(editor, used_shots):
+    """把 fake 截图计数器推进到 used_shots 之后，保证下一次 capture 的字节全新。
+
+    FakeScreenCapture 按 call_count 取底色并绘制 "SHOT N"，因此**新建的编辑器
+    实例计数器从 0 重启**，产出的第一张会与准备阶段的第一张逐字节相同。做
+    「重截图确实改写了内容」这类断言时必须先推进种子，否则会假失败。
+
+    :param used_shots: 现场已存在的截图张数（即已用掉的 call_count 个数）
+    """
+    fake = getattr(editor, "screen_capture", None)
+    if fake is not None and hasattr(fake, "call_count"):
+        fake.call_count = max(fake.call_count, used_shots)
+    return used_shots
 
 
 # ----------------------------------------------------------------------
@@ -213,3 +236,138 @@ def finish_task(editor, continue_new=False):
     finally:
         if ctrl is not None and previous is not None:
             ctrl.question_result = previous
+
+
+# ----------------------------------------------------------------------
+# gui 目录助手
+# ----------------------------------------------------------------------
+
+def gui_dir_of(editor):
+    """当前任务目录绝对路径（产品在各处自行赋值，取属性即可）。"""
+    gui_dir = editor.gui_dir
+    if not gui_dir:
+        gui_dir = os.path.join(editor.data_manager.current_dir,
+                               f"gui_{editor.gui_number}")
+    return gui_dir
+
+
+def gui_number_from_dir(path):
+    """从 gui_xxxxxx 目录名（或含该层的完整路径）提取 6 位编号。"""
+    name = os.path.basename(os.path.normpath(str(path)))
+    match = re.fullmatch(r"gui_(\d{6})", name)
+    assert match, f"不是 gui_xxxxxx 形式的任务目录：{path}"
+    return match.group(1)
+
+
+# ----------------------------------------------------------------------
+# 多轮 / 编辑模式助手
+# ----------------------------------------------------------------------
+
+def walk_rounds(editor, rounds_spec, finish_action="terminate"):
+    """多轮走步助手：逐轮采集并以 answer 落轮，最后一轮收尾写最终 JSON。
+
+    :param rounds_spec: [(步数, 该轮任务指令, 动作), ...]；动作为 iOS action_combo
+        的英文 key（click/scroll/drag/type/...），缺省 "click"。
+    :param finish_action: 最后一轮的收尾动作；None 表示不落收尾，留给调用方。
+    :return: 最终 JSON 路径（finish_action 为 None 时返回 None）。
+
+    机制说明：iOS 的 answer 分支（confirm_step:1766）先同步 _save_current_round_to_list
+    （内部已清空 steps_data），再 singleShot(300) 弹 _start_new_round(from_answer=True)
+    并从 QInputDialog.getText 取新指令，故必须在第 r 轮落轮**之前**把
+    dialogs.next_instruction 预置为第 r+1 轮指令；这同时覆盖 B14（取消新轮后沿用
+    旧指令）类场景。
+    """
+    ctrl = getattr(editor, "_test_dialogs", None)
+    total = len(rounds_spec)
+
+    for r, spec in enumerate(rounds_spec):
+        n_steps = spec[0]
+        instruction = spec[1]
+        action = spec[2] if len(spec) > 2 else "click"
+        is_last = (r == total - 1)
+
+        if ctrl is not None and not is_last:
+            ctrl.next_instruction = rounds_spec[r + 1][1]
+        editor.task_instruction = instruction
+
+        for i in range(n_steps):
+            capture(editor)
+            fill_step(editor, action=action, intent=f"第{r + 1}轮第{i + 1}步")
+            confirm(editor)
+        assert len(editor.steps_data) == n_steps, (
+            f"第 {r + 1} 轮走步后 steps_data 长度应为 {n_steps}，"
+            f"实际 {len(editor.steps_data)}"
+        )
+
+        if is_last:
+            break
+
+        # answer 落轮 + 300ms 后续轮对话框
+        capture(editor)
+        fill_step(editor, action="answer", intent=f"第{r + 1}轮回答",
+                  text=f"第{r + 1}轮回答")
+        confirm(editor)
+        expected_rounds = r + 1
+        expected_instruction = rounds_spec[r + 1][1]
+        _wait_until(lambda: len(editor.rounds) == expected_rounds,
+                    message=f"第 {expected_rounds} 轮未落轮")
+        _wait_until(lambda: editor.task_instruction == expected_instruction,
+                    message=f"续轮后任务指令未切换为第 {r + 2} 轮："
+                            f"{editor.task_instruction!r}")
+        assert editor.steps_data == [], (
+            f"第 {r + 1} 轮续轮后 steps_data 未清空：{len(editor.steps_data)}"
+        )
+
+    if finish_action is None:
+        return None
+    return finish_task_final(editor, finish_action)
+
+
+def finish_task_final(editor, action="terminate"):
+    """按指定动作收尾当前轮（terminate / answer_terminate），返回最终 JSON 路径。
+
+    与 finish_task 的区别：动作可选、且默认答 No（不继续新任务）。
+    """
+    ctrl = getattr(editor, "_test_dialogs", None)
+    previous = None
+    if ctrl is not None:
+        previous = ctrl.question_result
+        ctrl.question_result = QMessageBox.No
+    try:
+        if editor._current_screenshot_filename is None:
+            capture(editor)
+        fill_step(editor, action=action, intent=f"收尾-{action}")
+        editor.confirm_step()
+        _wait_until(lambda: editor._final_data_saved or bool(editor.rounds),
+                    message="收尾后未落轮/未写盘")
+        QTest.qWait(_STEP_MS)
+    finally:
+        if ctrl is not None and previous is not None:
+            ctrl.question_result = previous
+    return os.path.join(gui_dir_of(editor), f"gui_{editor.gui_number}.json")
+
+
+def open_edit_mode(editor, gui_dir, round_index=0):
+    """把编辑器切到「编辑已完成任务」态，复用产品入口（不经 QFileDialog）。
+
+    :return: (before_data, before_coords) —— **深拷贝快照**，供
+        invariants.assert_edit_writeback_preserved 做 INV-13 比对。传本体则可能
+        被 load_from_completed_json 原地污染，导致失真的“零差异”假绿。
+
+    注：iOS 的 load_from_completed_json 无返回值，故只断言 _edit_mode 已置位。
+    """
+    from data_manager import DataManager
+
+    data, error = DataManager.load_json_from_dir(gui_dir)
+    assert not error, f"读取已完成任务失败：{error}"
+    coords_entries, coords_error = DataManager.load_coords_from_dir(gui_dir)
+    if coords_error:
+        coords_entries = []
+
+    snapshot_data = copy.deepcopy(data)
+    snapshot_coords = copy.deepcopy(coords_entries)
+
+    editor.load_from_completed_json(data, coords_entries, round_index, gui_dir)
+    assert editor._edit_mode, "载入后未进入编辑模式"
+    QTest.qWait(_STEP_MS)
+    return snapshot_data, snapshot_coords

@@ -59,10 +59,14 @@ class DataManager:
         return gui_dir_path
 
     def get_next_screenshot_number(self, gui_number):
-        """扫描 gui_编号 目录下已有截图序号，返回最小未占用序号（从 1 开始）
+        """扫描 gui_编号 目录下已有截图序号，返回 max(已有序号) + 1（3.1 B38）
 
-        使用“最小可用序号”而非 max+1，避免重截中间步骤删除旧图后
-        产生编号空号（不连续）。
+        三端语义统一为「全局递增」。原实现按「最小未占用序号」分配，删图/撤销
+        留下的空洞会被后续任意新截图复用，文件名序号与 step 顺序彻底脱钩（B38），
+        也无法从文件名区分「第 N 步的原始截图」与「后来补采的截图」。
+
+        代价：删中间步/重截后允许序号留洞——「顺序可追溯」的责任交给 step 字段，
+        INV-11 只钉「全局唯一 + 命名合规 + 引用存在 + 单调递增（插入场景放宽）」。
         """
         gui_dir = self.create_gui_directory(gui_number)
         prefix = f"gui_{gui_number}_"
@@ -75,53 +79,120 @@ class DataManager:
                         used.add(int(num_part))
         except OSError:
             pass
-        num = 1
-        while num in used:
-            num += 1
-        return num
+        return max(used) + 1 if used else 1
 
-    def save_screenshot(self, gui_number, app_name, screenshot_path):
-        """将截图文件复制到 gui_编号 目录，按目录内已有序号递增命名（gui_编号_序号.png）"""
+    def save_screenshot(self, gui_number, app_name, screenshot_path, filename=None):
+        """将截图文件复制到 gui_编号 目录（gui_编号_序号.png）
+
+        filename 为 None 时按目录内最小未占用序号命名（新步骤截图）；
+        filename 指定时原地覆盖该文件（同步骤重新截图，序号保持不变）。
+        覆盖采用“复制到同目录临时文件 + os.replace”方式，
+        复制失败时旧文件保留，避免“旧图已删、新图未写”的不可逆窗口。
+        """
         gui_dir = self.create_gui_directory(gui_number)
-        next_num = self.get_next_screenshot_number(gui_number)
-        filename = f"gui_{gui_number}_{next_num:04d}.png"
+        if filename is None:
+            next_num = self.get_next_screenshot_number(gui_number)
+            filename = f"gui_{gui_number}_{next_num:04d}.png"
+        else:
+            # B50 加固：filename 来自草稿/已交付 JSON，可能被篡改为穿越路径。
+            # 仅允许写入当前 gui 目录下属于该 gui 编号的截图，非法名直接拒绝。
+            safe_name = os.path.basename(filename)
+            prefix = f"gui_{gui_number}_"
+            if not safe_name.startswith(prefix) or not safe_name.endswith((".png", ".jpg")):
+                print(f"保存截图失败: 非法文件名 {filename}")
+                return None
+            filename = safe_name
         dest_path = os.path.join(gui_dir, filename)
 
         import shutil
+        tmp_dest = os.path.join(gui_dir, f".{filename}.tmp")
         try:
-            shutil.copy2(screenshot_path, dest_path)
+            shutil.copy2(screenshot_path, tmp_dest)
+            os.replace(tmp_dest, dest_path)
             return filename
         except Exception as e:
             print(f"保存截图失败: {e}")
+            try:
+                if os.path.isfile(tmp_dest):
+                    os.remove(tmp_dest)
+            except Exception:
+                pass
+            return None
+
+    @staticmethod
+    def _atomic_write_json(filepath, payload, err_label="保存 JSON 失败"):
+        """原子写 JSON：先写同目录隐藏临时文件，再 os.replace 换入目标。
+
+        直接 open(path, "w") 会立即截断原文件，序列化中途失败（磁盘写满、进程被杀、
+        数据含不可序列化对象）就留下半截或空文件——已交付数据不可恢复。
+        tmp + replace 的失败语义是「原文件保持不动」，与 save_screenshot 采用的
+        tmp + os.replace 口径一致。
+
+        :param filepath: 目标文件路径
+        :param payload: 待序列化的对象
+        :param err_label: 失败日志前缀
+        :return: 成功返回目标路径，失败返回 None
+        """
+        directory = os.path.dirname(filepath) or "."
+        tmp_path = os.path.join(directory, f".{os.path.basename(filepath)}.tmp")
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, filepath)
+            return filepath
+        except Exception as e:
+            print(f"{err_label}: {e}")
+            try:
+                if os.path.isfile(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            return None
+
+    def backup_final_json(self, gui_number):
+        """编辑写回前把现存最终 JSON 复制为 gui_编号.json.bak（覆盖式安全网）
+
+        仅当源文件存在时才生成；复制失败只告警不阻断保存——备份是兜底，
+        不该因它写不进去而拒掉用户正常的修改落盘。
+
+        :param gui_number: GUI 编号
+        :return: 备份文件路径；无原文件或复制失败时返回 None
+        """
+        gui_dir = self.create_gui_directory(gui_number)
+        src = os.path.join(gui_dir, f"gui_{gui_number}.json")
+        if not os.path.isfile(src):
+            return None
+        dst = f"{src}.bak"
+        try:
+            import shutil
+            shutil.copy2(src, dst)
+            return dst
+        except Exception as e:
+            print(f"备份 JSON 失败: {e}")
             return None
 
     def save_json_data(self, data, gui_number):
-        """保存主 JSON 数据文件"""
+        """保存主 JSON 数据文件（tmp + os.replace 原子写）"""
         gui_dir = self.create_gui_directory(gui_number)
         filename = f"gui_{gui_number}.json"
         filepath = os.path.join(gui_dir, filename)
 
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            return filepath
-        except Exception as e:
-            print(f"保存 JSON 失败: {e}")
-            return None
+        return self._atomic_write_json(filepath, data, "保存 JSON 失败")
 
     def save_coords_json(self, coords_data, gui_number):
-        """保存拉框坐标信息到 gui_XXXXXX_coords.json"""
+        """保存拉框坐标信息到 gui_XXXXXX_coords.json（tmp + os.replace 原子写）
+
+        Android 保持 {"version","coords"} 对象顶层结构不变，仅写入方式改为原子写。
+        """
         gui_dir = self.create_gui_directory(gui_number)
         filename = f"gui_{gui_number}_coords.json"
         filepath = os.path.join(gui_dir, filename)
 
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump({"version": "3.0", "coords": coords_data}, f, ensure_ascii=False, indent=2)
-            return filepath
-        except Exception as e:
-            print(f"保存坐标 JSON 失败: {e}")
-            return None
+        return self._atomic_write_json(
+            filepath, {"version": "3.0", "coords": coords_data}, "保存坐标 JSON 失败"
+        )
 
     def load_screenshot(self, gui_number, filename):
         """从磁盘加载截图（内存解耦后预览图按需从文件重建）

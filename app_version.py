@@ -9,7 +9,7 @@
 import re
 
 # 语义化版本号：主版本号.次版本号.补丁号
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 
 # UNC 网络共享发布目录（构建产物与 version.json 均发布于此）
 PUBLISH_DIR = r"\\NAS-TC\GUI采集300step\工具\GUI长步骤采标工具-Windows"

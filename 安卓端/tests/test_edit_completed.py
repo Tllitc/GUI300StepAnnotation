@@ -224,13 +224,15 @@ def test_edit_round_two_save_only_replaces_selected_round(tmp_path, qapp, modal)
     assert coord_data.get("version") == "3.0"
     entries = coord_data["coords"]
     assert len(entries) == 5
-    assert entries[:3] == coords_entries[:3], "未编辑轮次坐标发生变化"
-    assert entries[3]["step"] == 0
-    assert entries[3]["action"] == "click"
-    assert entries[3]["vertices"] == [10, 20, 110, 220]
-    assert entries[3]["center"] == [50, 60]
-    assert entries[3]["source"] == "coords-v1"
-    assert "round" not in entries[3], "Android coords 不应添加 round 字段"
+    # 4.2（B4/B18）写盘副本按所属轮次注入 round；去掉 round 后其余字段逐字段不变
+    assert [e.get("round") for e in entries] == [0, 0, 0, 1, 1]
+    stripped = [{k: v for k, v in e.items() if k != "round"} for e in entries]
+    assert stripped[:3] == coords_entries[:3], "未编辑轮次坐标发生变化"
+    assert stripped[3]["step"] == 0
+    assert stripped[3]["action"] == "click"
+    assert stripped[3]["vertices"] == [10, 20, 110, 220]
+    assert stripped[3]["center"] == [50, 60]
+    assert stripped[3]["source"] == "coords-v1"
 
 
 def test_edit_mode_never_writes_draft_and_close_autosaves(tmp_path, qapp):

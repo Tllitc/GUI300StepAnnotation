@@ -191,7 +191,8 @@ def test_save_edited_round0_only_replaces_round0(editor):
         assert saved[key] == original[key]
 
     saved_coords = H.read_final_coords(editor)
-    assert saved_coords[-1] == coords[-1]
+    # 4.2（B4/B18）写盘副本按所属轮次注入 round，其余字段逐字段不变
+    assert saved_coords[-1] == {**coords[-1], "round": 1}
 
 
 # ---------------------------------------------------------------------------

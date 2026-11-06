@@ -38,6 +38,49 @@ import app_version
 import updater
 
 
+# 1.6（B3）编辑模式选轮次：候选项渲染与下标解析。
+# 早前摘要只截指令前若干字，同指令的多轮会渲染出完全相同的字符串，而定位
+# 用的是 items.index(selected)——永远命中第一个，于是改错轮并把错误内容写回
+# 已交付数据，不可恢复。现在：候选项一律带轮次序号与步数保证两两不同；下标
+# 直接取自 enumerate 的位置映射，不再做字符串搜索；无法唯一确定时交回 None，
+# 由调用方中止，绝不静默退回第 1 轮。
+ROUND_SUMMARY_CHARS = 30
+
+
+def build_round_choices(rounds, summary_chars=ROUND_SUMMARY_CHARS):
+    """渲染「选择要编辑的轮次」的候选项。
+
+    :param rounds: 轮次列表，元素为 {"instruction", "trajectory"} 或
+        (instruction, trajectory) 二元组
+    :return: (items, index_by_item)。items 出现重复时 index_by_item 为 None，
+        调用方必须放弃编辑，而不是猜一个轮次。
+    """
+    items = []
+    for i, round_data in enumerate(rounds):
+        if isinstance(round_data, dict):
+            instruction = round_data.get("instruction") or ""
+            trajectory = round_data.get("trajectory") or []
+        else:
+            instruction, trajectory = round_data
+        summary = instruction.strip().replace("\n", " ")
+        if not summary:
+            summary = "(无指令)"
+        if len(summary) > summary_chars:
+            summary = summary[:summary_chars] + "..."
+        items.append(f"第 {i + 1} 轮（{len(trajectory)} 步）：{summary}")
+
+    if len(set(items)) != len(items):
+        return items, None
+    return items, {text: i for i, text in enumerate(items)}
+
+
+def resolve_round_index(index_by_item, selected):
+    """把对话框返回的文本换成轮次下标；无法唯一确定时返回 None。"""
+    if not index_by_item or selected is None:
+        return None
+    return index_by_item.get(selected)
+
+
 class InitTaskWindow(QMainWindow):
     """任务初始化窗口"""
 
@@ -374,19 +417,19 @@ class InitTaskWindow(QMainWindow):
         round_index = 0
         if len(rounds) >= 2:
             from PyQt5.QtWidgets import QInputDialog
-            items = []
-            for i, round_data in enumerate(rounds):
-                summary = (round_data.get("instruction") or "").strip().replace("\n", " ")[:30]
-                items.append(f"第 {i + 1} 轮：{summary}")
+            items, index_by_item = build_round_choices(rounds)
             selected, ok = QInputDialog.getItem(
                 self, "选择轮次", "请选择要编辑的轮次：", items, 0, False
             )
             if not ok or not selected:
                 return
-            try:
-                round_index = items.index(selected)
-            except ValueError:
-                round_index = 0
+            round_index = resolve_round_index(index_by_item, selected)
+            if round_index is None:
+                QMessageBox.critical(
+                    self, "错误",
+                    "无法唯一确定所选轮次，已取消编辑（原数据保持不变）"
+                )
+                return
 
         base_dir = os.path.dirname(os.path.normpath(gui_dir))
         self.data_manager = DataManager(base_dir=base_dir)

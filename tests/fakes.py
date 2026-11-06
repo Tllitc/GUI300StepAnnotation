@@ -106,6 +106,7 @@ class FakeScreenshotCaptureWindow(QWidget):
         colors:            每次截图使用的底色（按调用顺序）
         rect_history:      每次发出的 rect_info 列表
         selection_history: 每次发出的 selection_type 列表
+        background_pixmap: 「在原图上重新拉框」入口传入的磁盘原图（普通截图为 None）
     """
 
     capture_completed = pyqtSignal(object, object, tuple, str)
@@ -117,8 +118,16 @@ class FakeScreenshotCaptureWindow(QWidget):
     _next_single_rect = None         # None 表示用 default_rect
     _next_dual_rect = None           # None 表示用 default_dual_rect (嵌套二元组)
 
-    def __init__(self, parent=None):
+    # 每次实例化收到的 background_pixmap（普通截图入口为 None，
+    # 「在原图上重新拉框」入口为磁盘原图）。reset_prepare() 会清空。
+    background_history = []
+
+    def __init__(self, parent=None, background_pixmap=None):
         super().__init__(parent)
+        # 「在原图上重新拉框」入口会传 background_pixmap（磁盘原截图）；
+        # 记录它以便断言弹窗拿到的确实是磁盘图而不是新抓的屏
+        self.background_pixmap = background_pixmap
+        FakeScreenshotCaptureWindow.background_history.append(background_pixmap)
         self.call_count = 0
         self.colors = []
         self.rect_history = []
@@ -201,6 +210,7 @@ class FakeScreenshotCaptureWindow(QWidget):
         cls._next_selection_type = None
         cls._next_single_rect = None
         cls._next_dual_rect = None
+        cls.background_history = []
 
     # -------------- 测试辅助 --------------
     def classify(self, path):

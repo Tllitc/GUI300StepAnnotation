@@ -125,32 +125,61 @@ def auto_dialogs(dialogs):
 
 
 @pytest.fixture
-def editor(qapp, dm, dialogs):
-    """function 级真实 AnnotationEditor：
+def editor_factory(qapp, dm, dialogs):
+    """构造 AnnotationEditor 的工厂（可在同一测试内造第二个实例）。
+
+    make(auto_init=True) 时调用 initialize_gui_directory() 建立 gui_XXXXXX 目录；
+    auto_init=False 用于「编辑已完成任务」场景（gui_dir 由
+    load_from_completed_json 显式传入，不应预先占用新目录）。
+
+    用例结束时统一 close + 等待在途 singleShot（50ms 截图 / 300ms 新轮）触发
+    完毕后再 deleteLater，避免回调命中已析构对象。
+    """
+    editors = []
+
+    def make(app_name="测试App", task_instruction="测试指令", app_type="iOS",
+             screen_info=None, auto_init=True):
+        ed = AnnotationEditor(
+            data_manager=dm,
+            app_name=app_name,
+            task_instruction=task_instruction,
+            screen_info=screen_info or {"screen_size": [390, 844]},
+            app_type=app_type,
+            udid=None,
+            close_callback=None,
+        )
+        if auto_init:
+            # 产品代码真实的任务目录初始化入口（设置 gui_number / gui_dir）
+            ed.initialize_gui_directory()
+        # 注入桩截图器，后续 take_screenshot->_do_screenshot 全链路走真实产品代码
+        ed.screen_capture = FakeScreenCapture()
+        # 助手函数（helpers.finish_task 等）借此临时调整对话框应答
+        ed._test_dialogs = dialogs
+        editors.append(ed)
+        qapp.processEvents()
+        return ed
+
+    yield make
+
+    for ed in editors:
+        try:
+            ed.close()
+        except Exception:
+            pass
+    if editors:
+        from PyQt5.QtTest import QTest
+        QTest.qWait(600)
+    for ed in editors:
+        ed.deleteLater()
+    qapp.processEvents()
+
+
+@pytest.fixture
+def editor(editor_factory):
+    """function 级真实 AnnotationEditor（默认已初始化任务目录）。
 
     - 使用临时 DataManager；
     - 构造后调用 initialize_gui_directory() 初始化 gui_XXXXXX 任务目录；
     - 用 FakeScreenCapture 替换 editor.screen_capture（不依赖真机）。
     """
-    ed = AnnotationEditor(
-        data_manager=dm,
-        app_name="测试App",
-        task_instruction="测试指令",
-        screen_info={"screen_size": [390, 844]},
-        app_type="iOS",
-        udid=None,
-        close_callback=None,
-    )
-    # 产品代码真实的任务目录初始化入口（设置 gui_number / gui_dir）
-    ed.initialize_gui_directory()
-    # 注入桩截图器，后续 take_screenshot->_do_screenshot 全链路走真实产品代码
-    ed.screen_capture = FakeScreenCapture()
-    # 助手函数（helpers.finish_task 等）借此临时调整对话框应答
-    ed._test_dialogs = dialogs
-
-    qapp.processEvents()
-    yield ed
-
-    ed.close()
-    ed.deleteLater()
-    qapp.processEvents()
+    return editor_factory()
