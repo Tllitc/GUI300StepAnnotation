@@ -34,6 +34,8 @@ from PyQt5.QtGui import QPixmap, QImage, QFont
 from screenshot_capture import ScreenshotCaptureWindow
 from annotation_editor import AnnotationEditor
 from data_manager import DataManager
+import app_version
+import updater
 # from permission_checker import check_and_request_all_permissions
 
 
@@ -148,7 +150,7 @@ class InitTaskWindow(QMainWindow):
     
     def __init__(self, hotkey_listener):
         super().__init__()
-        self.setWindowTitle("GUI长步骤采标工具-macOS - 任务初始化")
+        self.setWindowTitle(f"GUI长步骤采标工具-macOS v{app_version.__version__} - 任务初始化")
         self.setGeometry(100, 100, 600, 500)
         
         # 全局快捷键监听器
@@ -172,6 +174,9 @@ class InitTaskWindow(QMainWindow):
         
         # 存储母目录
         self.storage_dir = None
+        
+        # 当前唯一活动的标注窗口引用（返回菜单/关闭时会被置空）
+        self.annotation_window = None
         
         self.init_ui()
         
@@ -242,6 +247,12 @@ class InitTaskWindow(QMainWindow):
         resume_btn.clicked.connect(self.resume_annotation)
         btn_layout.addWidget(resume_btn)
 
+        # 已完成任务再编辑：选择 gui_xxxxxx 目录，按轮次打开编辑器修改并写回
+        edit_btn = QPushButton("编辑已完成任务")
+        edit_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; padding: 10px; font-size: 14px; }")
+        edit_btn.clicked.connect(self.edit_completed_annotation)
+        btn_layout.addWidget(edit_btn)
+
         layout.addLayout(btn_layout)
         layout.addStretch()
         
@@ -256,6 +267,21 @@ class InitTaskWindow(QMainWindow):
             self.storage_dir = directory
             self.storage_dir_label.setText(directory)
             self.storage_dir_label.setStyleSheet("color: black;")
+
+    def _discard_previous_editor(self):
+        """打开新编辑器前，确保上一个标注窗口已解绑快捷键并被销毁。"""
+        prev = self.annotation_window
+        if prev is None:
+            return
+        try:
+            # cleanup_resources 幂等：即便窗口已在关闭流程中也安全
+            prev.cleanup_resources()
+            prev.close()
+            prev.deleteLater()
+        except RuntimeError:
+            # 底层 C++ 对象可能已被销毁
+            pass
+        self.annotation_window = None
             
     def start_annotation(self):
         """开始标注流程"""
@@ -269,6 +295,9 @@ class InitTaskWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "请输入软件名称!")
             return
                 
+        # 清理可能残留的上一个标注窗口，避免幽灵窗口同时响应快捷键
+        self._discard_previous_editor()
+
         # 获取选择的软件类型
         app_type = self.app_type_combo.currentText()
         
@@ -359,6 +388,9 @@ class InitTaskWindow(QMainWindow):
             screen_info = self.data_manager.get_screen_info()
         task_instruction = draft.get("task_instruction", "")
 
+        # 清理可能残留的上一个标注窗口，避免幽灵窗口同时响应快捷键
+        self._discard_previous_editor()
+
         # 创建编辑器并从草稿恢复
         self.annotation_window = AnnotationEditor(
             data_manager=self.data_manager,
@@ -396,6 +428,105 @@ class InitTaskWindow(QMainWindow):
             self.annotation_window.status_label.setText(
                 f"新任务开始 - 指令: {self.annotation_window.task_instruction}")
 
+    def edit_completed_annotation(self):
+        """编辑已完成任务：选择 gui_xxxxxx 目录 → 选轮次 → 打开编辑器编辑并写回原文件"""
+        gui_dir = QFileDialog.getExistingDirectory(
+            self,
+            "选择要编辑的已完成任务目录",
+            self.storage_dir or os.path.expanduser("~")
+        )
+        if not gui_dir:
+            return
+
+        dir_name = os.path.basename(os.path.normpath(gui_dir))
+        match = re.fullmatch(r"gui_(\d{6})", dir_name)
+        if not match:
+            QMessageBox.warning(self, "警告", "请选择 gui_xxxxxx 形式的任务目录")
+            return
+
+        # 读取最终 JSON（目录未完成时会返回明确提示）；不修改磁盘任何文件
+        data, error = DataManager.load_json_from_dir(gui_dir)
+        if error:
+            QMessageBox.warning(self, "警告", error)
+            return
+
+        coords_entries, coords_error = DataManager.load_coords_from_dir(gui_dir)
+        if coords_error:
+            QMessageBox.warning(self, "警告", coords_error)
+            coords_entries = []
+
+        # 解析轮次（user/assistant 配对）
+        rounds = []
+        pending_instruction = ""
+        for message in data.get("messages", []) or []:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            if role == "user":
+                pending_instruction = message.get("instruction", "") or ""
+            elif role == "assistant":
+                rounds.append({
+                    "instruction": pending_instruction,
+                    "trajectory": message.get("trajectory", []) or []
+                })
+                pending_instruction = ""
+        if not rounds:
+            QMessageBox.warning(self, "警告", "该任务没有任何可编辑轮次")
+            return
+
+        round_index = 0
+        if len(rounds) >= 2:
+            from PyQt5.QtWidgets import QInputDialog
+            items = []
+            for i, round_data in enumerate(rounds):
+                summary = (round_data.get("instruction") or "").strip().replace("\n", " ")[:30]
+                items.append(f"第 {i + 1} 轮：{summary}")
+            selected, ok = QInputDialog.getItem(
+                self, "选择轮次", "请选择要编辑的轮次：", items, 0, False
+            )
+            if not ok or not selected:
+                return
+            try:
+                round_index = items.index(selected)
+            except ValueError:
+                round_index = 0
+
+        base_dir = os.path.dirname(os.path.normpath(gui_dir))
+        self.data_manager = DataManager(base_dir=base_dir)
+
+        # 最终 JSON 中没有 app_name，使用目录名；app_type 仅用于新建任务，编辑时留空
+        app_name = dir_name
+        app_type = ""
+        screen_info = {
+            "platform": data.get("platform") or "",
+            "system": data.get("system") or "",
+            "screen_size": data.get("screen_size") or [1920, 1080]
+        }
+        if not screen_info["platform"] or not screen_info["system"]:
+            fallback = self.data_manager.get_screen_info()
+            screen_info["platform"] = screen_info["platform"] or fallback.get("platform", "")
+            screen_info["system"] = screen_info["system"] or fallback.get("system", "")
+
+        # 清理可能残留的上一个标注窗口，避免幽灵窗口同时响应快捷键
+        self._discard_previous_editor()
+
+        self.annotation_window = AnnotationEditor(
+            data_manager=self.data_manager,
+            app_name=app_name,
+            task_instruction="",
+            screen_info=screen_info,
+            app_type=app_type,
+            hotkey_listener=self.hotkey_listener,
+            init_window=self
+        )
+        self.annotation_window.load_from_completed_json(
+            data, coords_entries, round_index, gui_dir
+        )
+        self.annotation_window.show()
+
+        # 隐藏初始化窗口
+        self.hide()
+
 
 def main():
     """主函数"""
@@ -406,6 +537,9 @@ def main():
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # 打包后启动时自动检查并应用更新（可能在此处重启进程）；源码运行时为空操作
+    updater.ensure_latest(app)
 
     # 先初始化全局快捷键监听器对象（不启动，等窗口显示后再启动）
     hotkey_listener = GlobalHotkeyListener()

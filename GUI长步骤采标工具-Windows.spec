@@ -37,3 +37,9 @@ exe = EXE(
     entitlements_file=None,
     icon=['logo17.ico'],
 )
+app = BUNDLE(
+    exe,
+    name='GUI长步骤采标工具-Windows.app',
+    icon='logo17.ico',
+    bundle_identifier=None,
+)

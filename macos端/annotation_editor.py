@@ -8,6 +8,7 @@
 
 import sys
 import os
+import re
 import math
 import copy
 from collections import OrderedDict
@@ -1294,6 +1295,27 @@ class AnnotationEditor(QMainWindow):
         self.current_step_index = -1
         # 截图模式标志：None=给下一步追加截图；整数=在该下标步骤之后插入一步
         self._capture_insert_after = None
+        # HARDENING-C：重截图开始时捕获的目标步下标（None=无进行中的重截图），
+        # 与插入锚点 _capture_insert_after 同思路，防止截图期间 index 漂移覆盖错步
+        self._recapture_target_index = None
+
+        # 生命周期标志：窗口正在关闭/已清理时为 True，截图入口据此拒绝响应，
+        # 避免“已返回主菜单的旧窗口”仍响应全局快捷键而成为幽灵窗口
+        self._is_closing = False
+        # 防止截图流程重入：隐藏窗口到截图遮罩弹出期间忽略重复的 Ctrl+Q
+        self._capture_in_flight = False
+        # DT-8 相关：stack 页序不变式曾被打穿时置 True，供 undo/delete 等危险操作拦截
+        self._stack_invariant_broken = False
+        # 最终数据已成功落盘标志：finish_all_annotation 成功后置 True，
+        # 使随后的 closeEvent 不再对同一批数据二次保存
+        self._final_data_saved = False
+
+        # 「已完成任务再编辑」模式状态
+        self._edit_mode = False
+        self._completed_json = None    # 原始最终 JSON 深拷贝，保存时以其为基底重建
+        self._edit_round_index = 0     # 正在编辑的轮次下标
+        self._coords_rounds = []       # 每轮一份 coords 列表（与 self.rounds 等长）
+        self._original_coords_exist = False
 
         # draft 增量自动保存（防抖定时器）
         self.draft_timer = QTimer(self)
@@ -1395,6 +1417,13 @@ class AnnotationEditor(QMainWindow):
         save_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
         save_btn.clicked.connect(self.confirm_button_clicked)
         toolbar.addWidget(save_btn)
+
+        # 编辑已完成任务时可见：校验当前轮并写回最终 JSON / coords
+        self.save_edit_btn = QPushButton("保存修改")
+        self.save_edit_btn.setStyleSheet("QPushButton { background-color: #3F51B5; color: white; }")
+        self.save_edit_btn.clicked.connect(lambda: self.save_edited_round(False))
+        self.save_edit_btn.hide()
+        toolbar.addWidget(self.save_edit_btn)
 
         right_layout.addLayout(toolbar)
 
@@ -1600,13 +1629,58 @@ class AnnotationEditor(QMainWindow):
         else:
             print("⚠️ 未设置全局快捷键监听器")
 
+    def cleanup_resources(self):
+        """窗口结束生命周期时的统一资源清理（幂等，可重复调用）。
+
+        - 断开本实例与全局快捷键信号的连接，确保不再响应 Control+Q；
+        - 停止 draft / 校验防抖定时器，避免幽灵实例上的延迟回调；
+        - 关闭可能残留的截图遮罩窗口。
+        """
+        if self._is_closing:
+            return
+        self._is_closing = True
+
+        if self.hotkey_listener is not None:
+            try:
+                self.hotkey_listener.screenshot_triggered.disconnect(self.start_capture)
+            except (TypeError, RuntimeError, AttributeError):
+                # 信号未连接或底层对象已销毁时忽略
+                pass
+            # macOS 监听器有第二个信号 save_continue_triggered（editor 未 connect），
+            # 防御性断开，异常静默
+            try:
+                self.hotkey_listener.save_continue_triggered.disconnect()
+            except (TypeError, RuntimeError, AttributeError):
+                pass
+
+        try:
+            self.draft_timer.stop()
+            self.validation_timer.stop()
+        except (AttributeError, RuntimeError):
+            pass
+
+        for attr in ("capture_window", "reference_capture_window"):
+            win = getattr(self, attr, None)
+            if win is not None:
+                try:
+                    win.close()
+                except RuntimeError:
+                    pass
+                setattr(self, attr, None)
+
     def recapture_current_step(self):
         """重新截取当前步骤的截图，如果没有步骤则开始第一个截图"""
+        if self._is_closing or self._capture_in_flight:
+            return
         if self.current_step_index < 0 or self.current_step_index >= len(self.steps):
             # 没有步骤时，开始第一个截图
             self.start_capture()
             return
 
+        # HARDENING-C：开始截图时即捕获目标步下标，避免截图期间 index 被改动
+        self._recapture_target_index = self.current_step_index
+        # 标记截图流程进行中，防止重入
+        self._capture_in_flight = True
         # 先将窗口设为完全透明（避免 hide() 动画过程被截图捕捉），再隐藏
         self.setWindowOpacity(0.0)
         self.hide()
@@ -1616,21 +1690,40 @@ class AnnotationEditor(QMainWindow):
 
     def show_recapture_window(self):
         """显示重新截图窗口"""
+        if self._is_closing:
+            self._capture_in_flight = False
+            self._recapture_target_index = None
+            return
         self.capture_window = ScreenshotCaptureWindow()
         self.capture_window.capture_completed.connect(self.on_recapture_completed)
         self.capture_window.show()
 
     def on_recapture_completed(self, original_pixmap, marked_pixmap, rect_info, selection_type):
         """重新截图完成回调"""
+        # 截图遮罩已关闭，解除重入守卫
+        self._capture_in_flight = False
+        # HARDENING-C：取出截图开始时捕获的目标步下标（与插入锚点同思路），
+        # 避免截图期间 current_step_index 被其他路径改动导致覆盖错步文件
+        target_index = self._recapture_target_index
         # 检查是否被取消
         if selection_type == "cancelled":
             # 用户取消了截图，重新显示主窗口
+            self._recapture_target_index = None
             self.restore_window()
             self.status_label.setText("重新截图已取消")
             return
 
-        # 获取当前步骤
-        current_step = self.steps[self.current_step_index]
+        # 目标下标失效时兜底退回实时 current_step_index
+        if not (isinstance(target_index, int) and 0 <= target_index < len(self.steps)):
+            target_index = self.current_step_index
+        if not (0 <= target_index < len(self.steps)):
+            self._recapture_target_index = None
+            QMessageBox.critical(self, "错误", "重新截图失败：目标步骤不存在")
+            self.restore_window()
+            return
+
+        # 获取目标步骤
+        current_step = self.steps[target_index]
 
         # 覆盖保存到原有的截图文件（复用原序号，不新增文件）
         filename = current_step["screenshot_filename"]
@@ -1639,46 +1732,17 @@ class AnnotationEditor(QMainWindow):
         )
 
         if filepath:
-            current_step["rect_info"] = rect_info
-            current_step["selection_type"] = selection_type
-            # 不再保存全屏 QPixmap 引用；预览用完即用即释放，历史预览从磁盘重建
-
+            # DT-7 修复：复用 _init_editor_from_capture 完成预览/坐标/双框归一化，
+            # 保证与新建步骤的口径一致（双框统一为 selection_type="drag"、自动选"拖拽"动作）
             editor = current_step["editor"]
-            editor.set_screenshot(marked_pixmap)
-            editor.set_preview_meta(filename, rect_info, selection_type)
-
-            # 判断是否为双框模式（拖拽动作）
-            if selection_type == "fullscreen":
-                pass
-            elif isinstance(rect_info, tuple) and len(rect_info) == 2 and isinstance(rect_info[0], tuple):
-                # 双框模式 - 拖拽动作
-                first_rect = rect_info[0]
-                second_rect = rect_info[1]
-
-                # 计算两个框的中心点
-                start_x = first_rect[0] + first_rect[2] // 2
-                start_y = first_rect[1] + first_rect[3] // 2
-                end_x = second_rect[0] + second_rect[2] // 2
-                end_y = second_rect[1] + second_rect[3] // 2
-
-                # 设置起点坐标
-                editor.coord_x_input.setText(str(start_x))
-                editor.coord_y_input.setText(str(start_y))
-
-                # 设置终点坐标
-                editor.end_coord_x_input.setText(str(end_x))
-                editor.end_coord_y_input.setText(str(end_y))
-
-                # 自动选择"拖拽"动作
-                drag_index = editor.action_type_combo.findText("拖拽")
-                if drag_index >= 0:
-                    editor.action_type_combo.setCurrentIndex(drag_index)
-            elif len(rect_info) == 4:
-                # 单框模式 - 原有逻辑
-                center_x = rect_info[0] + rect_info[2] // 2
-                center_y = rect_info[1] + rect_info[3] // 2
-                editor.coord_x_input.setText(str(center_x))
-                editor.coord_y_input.setText(str(center_y))
+            normalized_type = self._init_editor_from_capture(
+                editor, marked_pixmap, rect_info, selection_type
+            )
+            current_step["rect_info"] = rect_info
+            current_step["selection_type"] = normalized_type
+            editor.set_preview_meta(filename, rect_info, normalized_type)
+            # 让下次 _write_draft_now 走实时 editor.get_data() 而不是旧快照
+            current_step.pop("data", None)
 
             # 显示主窗口
             self.restore_window()
@@ -1686,26 +1750,34 @@ class AnnotationEditor(QMainWindow):
             self.status_label.setText(f"已重新捕获截图 {filename}")
             # 更新撤销按钮可见性
             self.update_undo_button_visibility()
-            # 截图已覆盖：失效该步骤缩略图缓存并重载条目（动作类型可能随拖拽框变化）
-            self.sidebar.invalidate_thumb(self.current_step_index)
-            item = self.sidebar.item_widgets[self.current_step_index] \
-                if self.current_step_index < len(self.sidebar.item_widgets) else None
+            # DEFECT-B 修复：截图已覆盖，按文件名清除该截图的全部缩略图缓存 key
+            # （旧 invalidate_thumb 用更新后的 rect/type 算新 key，清不掉旧死缓存），
+            # 再重载条目（动作类型可能随拖拽框变化）
+            self.sidebar.remove_thumb_cache_by_filename(filename)
+            item = self.sidebar.item_widgets[target_index] \
+                if target_index < len(self.sidebar.item_widgets) else None
             if item is not None:
                 item.thumb_loaded = False
-                self.sidebar.request_thumb(self.current_step_index, high_priority=True)
-                self.refresh_step_item(self.current_step_index)
+                self.sidebar.request_thumb(target_index, high_priority=True)
+                self.refresh_step_item(target_index)
+            self._recapture_target_index = None
             self.schedule_draft_save()
         else:
+            self._recapture_target_index = None
             QMessageBox.critical(self, "错误", "保存截图失败！")
             self.restore_window()
 
     def start_capture(self):
         """开始截图捕获（追加模式：新步骤加到末尾）"""
+        if self._is_closing or self._capture_in_flight:
+            return
         self._capture_insert_after = None
         self._hide_for_capture()
 
     def start_insert_capture(self):
         """在当前步骤之后插入一步截图（插入模式）"""
+        if self._is_closing or self._capture_in_flight:
+            return
         if not (0 <= self.current_step_index < len(self.steps)):
             return
         # 记录插入锚点：新步将插入到该下标 +1 位置
@@ -1714,6 +1786,8 @@ class AnnotationEditor(QMainWindow):
 
     def _hide_for_capture(self):
         """截图前隐藏主窗口（追加/插入两路径共用）"""
+        # 标记截图流程进行中，防止隐藏到遮罩弹出期间重复响应截图热键
+        self._capture_in_flight = True
         # 先将窗口设为完全透明（避免 hide() 动画过程被截图捕捉），再隐藏
         self.setWindowOpacity(0.0)
         self.hide()
@@ -1723,6 +1797,9 @@ class AnnotationEditor(QMainWindow):
 
     def show_capture_window(self):
         """显示截图窗口"""
+        if self._is_closing:
+            self._capture_in_flight = False
+            return
         self.capture_window = ScreenshotCaptureWindow()
         self.capture_window.capture_completed.connect(self.on_capture_completed)
         self.capture_window.show()
@@ -1774,6 +1851,8 @@ class AnnotationEditor(QMainWindow):
 
     def on_capture_completed(self, original_pixmap, marked_pixmap, rect_info, selection_type):
         """截图完成回调（根据 self._capture_insert_after 区分追加 / 插入）"""
+        # 截图遮罩已关闭，解除重入守卫（取消/成功两条路径都会走到这里）
+        self._capture_in_flight = False
         # 取出插入锚点（无论取消与否都要复位模式标志）
         insert_after = self._capture_insert_after
 
@@ -1895,15 +1974,23 @@ class AnnotationEditor(QMainWindow):
         self._check_stack_invariant()
 
     def _check_stack_invariant(self):
-        """校验 stack 页序不变式（异常只打印，不打断用户操作）"""
+        """校验 stack 页序不变式
+
+        DT-8 修复：异常时除打印外，同时置 self._stack_invariant_broken=True，
+        使 undo/delete 等危险操作可以先做前置拦截，防止"stack 页序已乱还 widget(count-1)"
+        删错编辑器/删错文件的连锁破坏。
+        """
         try:
             assert self.stack_widget.count() == len(self.steps) + 1, \
                 f"stack 页数 {self.stack_widget.count()} != 步数+1 {len(self.steps) + 1}"
             for i, step in enumerate(self.steps):
                 assert self.stack_widget.widget(i + 1) is step["editor"], \
                     f"第 {i} 步对应的 stack 页不是其编辑器（页下标 {i + 1}）"
+            # 全部通过：复位标志
+            self._stack_invariant_broken = False
         except AssertionError as e:
-            print(f"stack 页序不变式校验失败: {e}")
+            self._stack_invariant_broken = True
+            print(f"[INV] stack 页序不变式校验失败: {e}（已置 _stack_invariant_broken=True）")
 
     def _renumber_steps_from(self, start_index):
         """从 start_index 起按新下标连续重编号：编辑器显示编号 + 已有 data 快照的 step 字段
@@ -1919,10 +2006,21 @@ class AnnotationEditor(QMainWindow):
                 data["step"] = i
 
     def _delete_screenshot_file(self, filename):
-        """删除指定步骤的磁盘截图文件，失败仅打印不阻断主流程"""
+        """删除指定步骤的磁盘截图文件，失败仅打印不阻断主流程。
+
+        DT-6 修复：删除前先检查 filename 是否仍被 self.rounds 中某条 trajectory
+        引用（轮次已结束、trajectory 已落 rounds 时不能删，否则历史轮次引用失效）。
+        """
         try:
             if self.gui_number is None:
                 return
+            # DT-6: 跳过被 rounds 引用的文件
+            for round_data in self.rounds:
+                for traj in round_data.get("trajectory", []):
+                    obs = traj.get("observation") or {}
+                    if obs.get("screenshot") == filename:
+                        print(f"_delete_screenshot_file: {filename!r} 仍被历史轮次引用，跳过删除")
+                        return
             gui_dir = os.path.join(self.data_manager.current_dir, f"gui_{self.gui_number}")
             filepath = os.path.join(gui_dir, filename)
             if os.path.exists(filepath):
@@ -2151,44 +2249,67 @@ class AnnotationEditor(QMainWindow):
         self.sidebar.refresh_dashboard()
 
     def undo_last_step(self):
-        """撤销上一步"""
-        if len(self.steps) > 0:
-            reply = QMessageBox.question(
-                self,
-                "确认撤销",
-                "确定要撤销最后一步吗？",
-                QMessageBox.Yes | QMessageBox.No
+        """撤销上一步
+
+        DT-9 修复：只有当当前步就是最后一步时才允许撤销（与按钮可见性约束一致）。
+        非末步被触发时（可见性被破坏）弹出提示并拒绝执行，避免出现
+        "steps.pop() 删末尾步但 current_step_index 仍指向中间步" 的模型错位。
+        同时 DT-8 修复：stack 不变式已破时也拒绝操作，防止删错编辑器。
+        """
+        if len(self.steps) == 0:
+            return
+        # DT-9: 非末步拦截
+        if self.current_step_index != len(self.steps) - 1:
+            QMessageBox.warning(
+                self, "撤销提示",
+                f"当前停在第 {self.current_step_index + 1} 步，只能撤销最后一步（第 {len(self.steps)} 步）。\n"
+                f"请先跳到最后一步再撤销。"
             )
+            return
+        # DT-8: stack 不变式已破，拒绝危险操作
+        if getattr(self, "_stack_invariant_broken", False):
+            QMessageBox.warning(
+                self, "数据异常",
+                "内部页序状态不一致，已自动拦截撤销操作以避免数据破坏。"
+            )
+            return
 
-            if reply == QMessageBox.Yes:
-                # 移除最后一个步骤
-                removed = self.steps.pop()
+        reply = QMessageBox.question(
+            self,
+            "确认撤销",
+            f"确定要撤销最后一步（第 {len(self.steps)} 步）吗？",
+            QMessageBox.Yes | QMessageBox.No
+        )
 
-                # 从 stack widget 移除（撤销的永远是最后一页，setParent(None) 释放）
-                widget = self.stack_widget.widget(self.stack_widget.count() - 1)
-                self.stack_widget.removeWidget(widget)
-                widget.setParent(None)
+        if reply == QMessageBox.Yes:
+            # 移除最后一个步骤
+            removed = self.steps.pop()
 
-                # 删除截图文件（失败仅打印不阻断），并清理其缩略图缓存
-                removed_filename = removed.get("screenshot_filename", "")
-                self._delete_screenshot_file(removed_filename)
-                self.sidebar.remove_thumb_cache_by_filename(removed_filename)
+            # 从 stack widget 移除（撤销的永远是最后一页，setParent(None) 释放）
+            widget = self.stack_widget.widget(self.stack_widget.count() - 1)
+            self.stack_widget.removeWidget(widget)
+            widget.setParent(None)
 
-                # 调整当前索引
-                if self.current_step_index >= len(self.steps):
-                    self.current_step_index = len(self.steps) - 1
+            # 删除截图文件（失败仅打印不阻断），并清理其缩略图缓存
+            removed_filename = removed.get("screenshot_filename", "")
+            self._delete_screenshot_file(removed_filename)
+            self.sidebar.remove_thumb_cache_by_filename(removed_filename)
 
-                if self.current_step_index >= 0:
-                    self.display_step(self.current_step_index)
-                else:
-                    self.stack_widget.setCurrentIndex(0)
-                    self.update_step_indicator()
+            # 调整当前索引：本来就是末步，撤销后就是新的末步或 -1
+            if self.current_step_index >= len(self.steps):
+                self.current_step_index = len(self.steps) - 1
 
-                # 撤销后所有条目序号前移，全量重建侧栏
-                self.refresh_sidebar(fully=True)
+            if self.current_step_index >= 0:
+                self.display_step(self.current_step_index)
+            else:
+                self.stack_widget.setCurrentIndex(0)
+                self.update_step_indicator()
 
-                self.status_label.setText("已撤销上一步")
-                self.schedule_draft_save()
+            # 撤销后所有条目序号前移，全量重建侧栏
+            self.refresh_sidebar(fully=True)
+
+            self.status_label.setText("已撤销上一步")
+            self.schedule_draft_save()
 
     def hide_window(self):
         """隐藏窗口"""
@@ -2320,37 +2441,9 @@ class AnnotationEditor(QMainWindow):
             # 询问是否创建新的标注任务
             self.show_new_task_dialog()
 
-    def save_current_round(self):
-        """保存当前轮次的数据到 rounds 列表"""
-        # 说明（删除/插入对齐）：本方法是轮次结束时唯一的落盘点，trajectory 与 coords
-        # entries 都在此刻按当时 self.steps 的 enumerate 下标 i 现场重建。轮次中途的
-        # 删除/插入只会改变 self.steps 顺序，任何 data 快照里旧的 "step" 不被读取
-        # （有快照的分支直接沿用快照对象，其 step 已在删除/插入时同步重编号），
-        # 因此最终写出的 step 一定与重排后的新下标一致；all_coords_entries 也没有
-        # 轮次中途缓存路径（全项目仅本方法 append）。
-        # 收集所有步骤数据
-        trajectory = []
-        for i, step in enumerate(self.steps):
-            if "data" in step:
-                trajectory.append(step["data"])
-            else:
-                # 如果步骤还没有保存，尝试从编辑器获取数据
-                editor = step["editor"]
-                step_data = editor.get_data()
-                step_data["observation"]["screenshot"] = step["screenshot_filename"]
-                # 将 step 字段放到首部
-                step_data_with_step = {"step": i}
-                step_data_with_step.update(step_data)
-                step_data = step_data_with_step
-                trajectory.append(step_data)
-
-        # 添加到轮次列表（只保存 instruction 和 trajectory）
-        self.rounds.append({
-            "instruction": self.task_instruction,
-            "trajectory": trajectory
-        })
-
-        # 提取需要坐标的步骤，收集其拉框顶点和中心点坐标
+    def _collect_coords_entries(self):
+        """按当前 self.steps 现场重建本轮 coords 条目列表（step 为轮内 0 起连续下标）"""
+        entries = []
         coord_action_types = {"left_click", "double_click", "triple_click",
                               "right_click", "middle_click", "mouse_move",
                               "left_click_drag", "type"}
@@ -2375,44 +2468,87 @@ class AnnotationEditor(QMainWindow):
                         x1, y1, w1, h1 = first_rect
                         x2, y2, w2, h2 = second_rect
 
-                        entry = {
+                        entries.append({
                             "step": i,
                             "action": action_type,
                             "start_vertices": [x1, y1, x1 + w1, y1 + h1],
                             "start_center": [x1 + w1 // 2, y1 + h1 // 2],
                             "end_vertices": [x2, y2, x2 + w2, y2 + h2],
                             "end_center": [x2 + w2 // 2, y2 + h2 // 2]
-                        }
-                        self.all_coords_entries.append(entry)
+                        })
                 else:
                     # 单框动作
                     if isinstance(rect_info, tuple) and len(rect_info) == 4:
                         x, y, w, h = rect_info
-                        entry = {
+                        entries.append({
                             "step": i,
                             "action": action_type,
                             "vertices": [x, y, x + w, y + h],
                             "center": [x + w // 2, y + h // 2]
-                        }
-                        self.all_coords_entries.append(entry)
+                        })
             except Exception as e:
                 print(f"提取步骤 {i} 的坐标信息时出错: {e}")
 
-        # 轮次边界立即落盘，不靠防抖
-        self._write_draft_now()
+        return entries
+
+    def save_current_round(self):
+        """保存当前轮次的数据到 rounds 列表"""
+        # 说明（删除/插入对齐）：本方法是轮次结束时唯一的落盘点，trajectory 与 coords
+        # entries 都在此刻按当时 self.steps 的 enumerate 下标 i 现场重建。轮次中途的
+        # 删除/插入只会改变 self.steps 顺序，任何 data 快照里旧的 "step" 不被读取
+        # （有快照的分支直接沿用快照对象，其 step 已在删除/插入时同步重编号），
+        # 因此最终写出的 step 一定与重排后的新下标一致；all_coords_entries 也没有
+        # 轮次中途缓存路径（全项目仅本方法 append）。
+        # 收集所有步骤数据
+        trajectory = []
+        for i, step in enumerate(self.steps):
+            # DT-4 修复：一律取实时 editor.get_data() 作为本轮轨迹，不优先用陈旧的
+            # step["data"] 快照（续采后用户编辑但未重新 confirm/save 时，旧快照会
+            # 被沿用导致最终 JSON 静默丢数据）。step 字段统一在本次重建时补齐。
+            editor = step["editor"]
+            step_data = copy.deepcopy(editor.get_data())
+            step_data.setdefault("observation", {})["screenshot"] = step["screenshot_filename"]
+            # step 字段放在首部，值为当前 enumerate 下标
+            existing_step = step_data.pop("step", None)
+            if existing_step != i:
+                step_data = {"step": i, **step_data}
+            else:
+                step_data["step"] = i
+            trajectory.append(step_data)
+
+        # 添加到轮次列表（只保存 instruction 和 trajectory）
+        self.rounds.append({
+            "instruction": self.task_instruction,
+            "trajectory": trajectory
+        })
+
+        # 提取需要坐标的步骤，收集其拉框顶点和中心点坐标
+        self.all_coords_entries.extend(self._collect_coords_entries())
+
+        # DT-2 修复：不再在 save_current_round 内部立即 _write_draft_now()。
+        # 调用方（save_current_step / finish_all_annotation / closeEvent）会在 steps 状态就绪后
+        # 通过 schedule_draft_save 或 delete_draft 处理。这样避免了"rounds 已追加、steps 还没清"
+        # 的瞬间 draft 同时包含本轮轨迹和 current_steps，防止崩溃恢复后同一轮被重复写入最终 JSON。
 
     def schedule_draft_save(self):
         """重启防抖定时器，1s 内无新变化后写 draft"""
+        # 编辑已完成任务时绝不生成 draft，避免已保存任务出现在「继续未完成任务」
+        if self._edit_mode:
+            return
         self.sidebar.set_draft_saving()
         self.draft_timer.stop()
         self.draft_timer.start()
 
     def _write_draft_now(self):
         """构造 draft 并写盘（失败仅打印日志，不打断主流程）"""
+        # 编辑已完成任务模式下不写草稿（关窗写回最终 JSON 由 closeEvent 处理）
+        if self._edit_mode:
+            return
         if self.gui_number is None:
             return
-        if not self.steps and not self.rounds:
-            return
+        # DT-1 修复：即使 steps 和 rounds 皆空，只要 gui_number 还在（即用户已有任务），
+        # 也必须落一份空状态 draft 覆盖磁盘上可能残留的旧草稿，
+        # 防止续采时已删步骤"复活"。只有在 gui_number 也不存在（完全没有任务）时才跳过。
 
         def to_list(value):
             # tuple 递归转 list，兼容 () 与嵌套双框结构
@@ -2423,12 +2559,18 @@ class AnnotationEditor(QMainWindow):
             return value
 
         current_steps = []
-        for step in self.steps:
-            if "data" in step:
-                step_data = step["data"]
-            else:
-                step_data = step["editor"].get_data()
-                step_data["observation"]["screenshot"] = step["screenshot_filename"]
+        # DT-4/DT-5 修复：一律取实时 editor.get_data() 作为 data 快照，不优先使用
+        # 步骤里可能陈旧的 step["data"]（续采后用户编辑但未重新确认时，旧快照会
+        # 被沿用导致草稿/最终 JSON 静默丢数据）。同时补齐 step 字段。
+        for i, step in enumerate(self.steps):
+            try:
+                step_data = copy.deepcopy(step["editor"].get_data())
+            except Exception:
+                step_data = copy.deepcopy(step.get("data") or {})
+            step_data.setdefault("observation", {})["screenshot"] = step["screenshot_filename"]
+            # 补齐 step 字段（放在首部）
+            if step_data.get("step") != i:
+                step_data = {"step": i, **{k: v for k, v in step_data.items() if k != "step"}}
             current_steps.append({
                 "screenshot_filename": step["screenshot_filename"],
                 "rect_info": to_list(step.get("rect_info")),
@@ -2556,6 +2698,373 @@ class AnnotationEditor(QMainWindow):
 
         # current_steps 为空但 rounds 非空：崩溃在 answer 后轮次重置、等待输入新指令时
         return not self.steps and bool(self.rounds)
+
+    # ---------- 已完成任务再编辑 ----------
+
+    @staticmethod
+    def _entry_round_index(entry):
+        """读取 coords 条目的 round 字段；不可用时返回 None"""
+        if not isinstance(entry, dict):
+            return None
+        value = entry.get("round")
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _trajectory_matches(trajectory, step, action):
+        """判断某轮 trajectory 中是否存在 (step, action) 对应的步骤"""
+        for item in trajectory or []:
+            if not isinstance(item, dict) or item.get("step") != step:
+                continue
+            actions = item.get("actions") or []
+            if action is None:
+                return True
+            if actions and isinstance(actions[0], dict) and actions[0].get("action") == action:
+                return True
+        return False
+
+    def _append_coord_by_alignment(self, entry, rounds, groups):
+        """按 trajectory 的 (step, action) 将条目对齐到某轮；无法对齐则追加到最后一轮"""
+        step = entry.get("step") if isinstance(entry, dict) else None
+        action = entry.get("action") if isinstance(entry, dict) else None
+        for idx, round_data in enumerate(rounds):
+            if self._trajectory_matches(round_data.get("trajectory"), step, action):
+                groups[idx].append(entry)
+                return
+        groups[-1].append(entry)
+
+    def _group_coords_by_round(self, rounds, coords_entries):
+        """把扁平 coords 条目按轮次分组（长度 = len(rounds)，绝不丢弃条目）
+
+        优先使用条目的 round 字段；旧文件无 round 时按 step 回退切分连续段，
+        段数与轮次不一致时按各轮 trajectory 的 (step, action) 对齐。
+        """
+        n = len(rounds)
+        if n == 0:
+            return []
+        groups = [[] for _ in range(n)]
+        entries = list(coords_entries or [])
+        if not entries:
+            return groups
+
+        if any(self._entry_round_index(e) is not None for e in entries):
+            for entry in entries:
+                round_idx = self._entry_round_index(entry)
+                if round_idx is None:
+                    self._append_coord_by_alignment(entry, rounds, groups)
+                elif 0 <= round_idx < n:
+                    groups[round_idx].append(entry)
+                else:
+                    # round 越界：追加到最后一轮，绝不丢弃
+                    groups[-1].append(entry)
+            return groups
+
+        # 无 round 字段：step 回退即视为下一轮，切分连续段
+        segments = []
+        current = []
+        prev_step = None
+        for entry in entries:
+            step = entry.get("step") if isinstance(entry, dict) else None
+            step_ok = isinstance(step, int) and not isinstance(step, bool)
+            if current and step_ok and isinstance(prev_step, int) and step < prev_step:
+                segments.append(current)
+                current = []
+            current.append(entry)
+            if step_ok:
+                prev_step = step
+        if current:
+            segments.append(current)
+
+        if len(segments) == n:
+            return segments
+
+        # 段数与轮次不一致：按 trajectory (step, action) 对齐，无法对齐的进最后一轮
+        for segment in segments:
+            for entry in segment:
+                self._append_coord_by_alignment(entry, rounds, groups)
+        return groups
+
+    @staticmethod
+    def _vertices_to_rect(vertices):
+        """coords 的 [x1, y1, x2, y2] → 编辑器 rect_info 的 (x, y, w, h)"""
+        x1, y1, x2, y2 = vertices[:4]
+        return int(x1), int(y1), int(x2) - int(x1), int(y2) - int(y1)
+
+    @classmethod
+    def _rect_info_from_coord_entry(cls, entry):
+        """coords 条目 → (rect_info, selection_type)；无坐标步视为全屏"""
+        if not isinstance(entry, dict):
+            return (), "fullscreen"
+        start = entry.get("start_vertices")
+        end = entry.get("end_vertices")
+        if start and end and len(start) >= 4 and len(end) >= 4:
+            return (cls._vertices_to_rect(start), cls._vertices_to_rect(end)), "drag"
+        vertices = entry.get("vertices")
+        if vertices and len(vertices) >= 4:
+            return cls._vertices_to_rect(vertices), None
+        return (), "fullscreen"
+
+    @staticmethod
+    def _find_coord_entry(coords, step, fallback_index):
+        """在该轮 coords 中按 step 查找条目；找不到则回退为顺序第 fallback_index 条"""
+        if not coords:
+            return None
+        for entry in coords:
+            if isinstance(entry, dict) and entry.get("step") == step:
+                return entry
+        if 0 <= fallback_index < len(coords) and isinstance(coords[fallback_index], dict):
+            return coords[fallback_index]
+        return None
+
+    def load_from_completed_json(self, completed_data, coords_entries, round_index, gui_dir):
+        """从已完成任务的最终 JSON + coords 重建编辑现场（在 show 之前调用）
+
+        :param completed_data: 最终 gui_XXXXXX.json 解析后的字典
+        :param coords_entries: coords JSON 的扁平条目列表（可为空）
+        :param round_index: 要编辑的轮次下标（0 起）
+        :param gui_dir: 该任务目录完整路径（截图存在性检查用）
+        :return: True 表示载入成功
+        """
+        dir_name = os.path.basename(os.path.normpath(gui_dir or ""))
+        match = re.fullmatch(r"gui_(\d{6})", dir_name)
+        if match:
+            self.gui_number = match.group(1)
+
+        # 按 user/assistant 配对重建全部轮次
+        rounds = []
+        pending_instruction = ""
+        for message in (completed_data or {}).get("messages", []) or []:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            if role == "user":
+                pending_instruction = message.get("instruction", "") or ""
+            elif role == "assistant":
+                rounds.append({
+                    "instruction": pending_instruction,
+                    "trajectory": copy.deepcopy(message.get("trajectory", []) or []),
+                })
+                pending_instruction = ""
+
+        if not rounds:
+            QMessageBox.warning(self, "编辑失败", "该任务没有任何可编辑轮次")
+            return False
+
+        self.rounds = rounds
+        if not (0 <= round_index < len(self.rounds)):
+            round_index = 0
+        self._edit_round_index = round_index
+        self.current_round_index = round_index
+        self._completed_json = copy.deepcopy(completed_data)
+        self._original_coords_exist = bool(coords_entries)
+        self._coords_rounds = self._group_coords_by_round(self.rounds, coords_entries or [])
+        self._edit_mode = True
+        self._final_data_saved = False
+        self.task_instruction = self.rounds[round_index].get("instruction", "")
+
+        # 清空 stack 并重建当前轮的步骤
+        while self.stack_widget.count() > 1:
+            widget = self.stack_widget.widget(1)
+            self.stack_widget.removeWidget(widget)
+            widget.setParent(None)
+        self.steps = []
+        self.current_step_index = -1
+
+        current_trajectory = self.rounds[round_index].get("trajectory", [])
+        current_coords = self._coords_rounds[round_index]
+        missing_files = []
+
+        for i, t_entry in enumerate(current_trajectory):
+            step_data = copy.deepcopy(t_entry) if isinstance(t_entry, dict) else {}
+            step_data.setdefault("step", i)
+            observation = step_data.setdefault("observation", {})
+            filename = observation.get("screenshot", "") or ""
+            observation["screenshot"] = filename
+
+            if filename and not os.path.exists(os.path.join(gui_dir, filename)):
+                missing_files.append(f"步骤 {i}: {filename}")
+
+            coord_entry = self._find_coord_entry(current_coords, step_data.get("step"), i)
+            rect_info, selection_type = self._rect_info_from_coord_entry(coord_entry)
+
+            step_editor = StepEditorWidget(step_data=step_data)
+            # 必填项实时校验 + 分栏 resize 后按磁盘原图重绘预览
+            self._connect_editor_validation_signals(step_editor)
+            step_editor.preview_resize_requested.connect(
+                lambda ed=step_editor: self._on_editor_preview_resize(ed)
+            )
+            step_editor.set_step_number(i)
+
+            self.steps.append({
+                "editor": step_editor,
+                "screenshot_filename": filename,
+                "rect_info": rect_info,
+                "selection_type": selection_type,
+                "data": step_data,
+                "confirmed": True,
+            })
+            self.stack_widget.addWidget(step_editor)
+
+        if self.steps:
+            self.display_step(0)
+        else:
+            self.stack_widget.setCurrentIndex(0)
+            self.update_step_indicator()
+
+        if missing_files:
+            QMessageBox.warning(
+                self,
+                "截图文件缺失",
+                "以下步骤的截图文件在磁盘上不存在，预览将无法显示：\n\n" + "\n".join(missing_files)
+            )
+
+        base_title = self.windowTitle()
+        if " - 编辑已完成任务" not in base_title:
+            self.setWindowTitle(base_title + " - 编辑已完成任务")
+        self.status_label.setText(
+            f"编辑已完成任务 gui_{self.gui_number} · 第 {round_index + 1} 轮"
+        )
+        self.save_edit_btn.show()
+
+        self.revalidate_all_missing()
+        self.refresh_sidebar(fully=True)
+        self.update_step_indicator()
+        self.sidebar.refresh_dashboard()
+        # 编辑模式不排 draft 保存
+        return True
+
+    @staticmethod
+    def _find_original_step(trajectory, filename):
+        """按截图文件名在原 trajectory 中找到被编辑的步骤"""
+        if not filename:
+            return None
+        for item in trajectory or []:
+            if not isinstance(item, dict):
+                continue
+            observation = item.get("observation")
+            if isinstance(observation, dict) and observation.get("screenshot") == filename:
+                return item
+        return None
+
+    def _merge_step_with_original(self, new_step, original_step):
+        """把原步骤中新数据缺失的键递归补上（新值优先），保留未暴露字段"""
+        if not isinstance(original_step, dict):
+            return new_step
+        if not isinstance(new_step, dict):
+            return copy.deepcopy(original_step)
+
+        merged = copy.deepcopy(new_step)
+        for key, old_value in original_step.items():
+            if key not in merged:
+                merged[key] = copy.deepcopy(old_value)
+                continue
+            new_value = merged[key]
+            if isinstance(new_value, dict) and isinstance(old_value, dict):
+                merged[key] = self._merge_step_with_original(new_value, old_value)
+            elif isinstance(new_value, list) and isinstance(old_value, list):
+                merged[key] = [
+                    self._merge_step_with_original(item, old_value[i])
+                    if isinstance(item, dict) and i < len(old_value)
+                    and isinstance(old_value[i], dict) else item
+                    for i, item in enumerate(new_value)
+                ]
+        return merged
+
+    def save_edited_round(self, silent=False):
+        """校验并仅写回正在编辑的轮次（其余轮次与顶层字段原样保留）
+
+        :param silent: True 时不弹窗（用于关闭窗口前自动写回）
+        :return: True 表示最终 JSON 写入成功
+        """
+        if self._edit_mode is False or not self._completed_json:
+            return False
+        round_index = self._edit_round_index
+        if not (0 <= round_index < len(self.rounds)):
+            return False
+
+        # 与「任务完成」一致的必填校验（silent 关闭写回时跳过）
+        if not silent:
+            missing_entries = []
+            for i in range(len(self.steps)):
+                reasons = self.validate_step_at(i)
+                if reasons:
+                    missing_entries.append((i, self._action_cn_name(i), reasons))
+            if missing_entries:
+                self.revalidate_all_missing()
+                self._show_validation_fail_dialog(missing_entries)
+                return False
+
+        # 本轮原始 trajectory（按截图文件名匹配，合并未暴露字段用）
+        original_trajectory = copy.deepcopy(self.rounds[round_index].get("trajectory", []))
+
+        trajectory = []
+        for i, step in enumerate(self.steps):
+            editor = step["editor"]
+            step_data = copy.deepcopy(editor.get_data())
+            step_data.setdefault("observation", {})["screenshot"] = step["screenshot_filename"]
+            existing_step = step_data.pop("step", None)
+            if existing_step != i:
+                step_data = {"step": i, **step_data}
+            else:
+                step_data["step"] = i
+
+            original_step = self._find_original_step(
+                original_trajectory, step["screenshot_filename"]
+            )
+            trajectory.append(self._merge_step_with_original(step_data, original_step))
+
+        self.rounds[round_index]["trajectory"] = trajectory
+        self._coords_rounds[round_index] = self._collect_coords_entries()
+
+        # 以原顶层字段为基底重建 messages，仅替换被编辑轮次
+        data = copy.deepcopy(self._completed_json)
+        data["messages"] = []
+        for round_data in self.rounds:
+            data["messages"].append({
+                "role": "user",
+                "instruction": round_data.get("instruction", ""),
+            })
+            data["messages"].append({
+                "role": "assistant",
+                "trajectory": round_data.get("trajectory", []),
+            })
+
+        filepath = self.data_manager.save_json_data(data, self.gui_number)
+        if not filepath:
+            if silent:
+                print(f"编辑模式关闭前保存修改失败（gui_{self.gui_number}）")
+            else:
+                QMessageBox.critical(self, "错误", "保存修改失败，磁盘上的原文件未改变！")
+            return False
+
+        # 扁平化各轮 coords 后写盘；原文件存在 coords 时即使为空也写，保持原契约
+        flat_coords = [entry for group in self._coords_rounds for entry in group]
+        if flat_coords or self._original_coords_exist:
+            try:
+                self.data_manager.save_coords_json(flat_coords, self.gui_number)
+            except Exception as e:
+                print(f"保存修改时写出坐标失败: {e}")
+        self.all_coords_entries = flat_coords
+        self._final_data_saved = True
+
+        if silent:
+            print(f"编辑模式关闭前已保存修改到: {filepath}")
+            return True
+
+        QMessageBox.information(
+            self, "保存成功",
+            f"已完成任务 gui_{self.gui_number} 第 {round_index + 1} 轮的修改已保存到：\n{filepath}"
+        )
+        self._return_to_init_menu()
+        return True
 
     def show_new_task_dialog(self):
         """显示是否创建新任务的对话框"""
@@ -2700,6 +3209,8 @@ class AnnotationEditor(QMainWindow):
         if filepath:
             # 最终数据已成功落盘，删除增量草稿（关窗应急保存路径不删，保留崩溃恢复能力）
             self.data_manager.delete_draft(self.gui_number)
+            # 标记已最终保存，随后的 closeEvent 不再对同一批数据二次落盘
+            self._final_data_saved = True
 
             msg = f"所有轮次数据已保存到:\n{filepath}"
             if coords_filepath:
@@ -2738,11 +3249,38 @@ class AnnotationEditor(QMainWindow):
         # 隐藏撤销按钮
         self.undo_btn.hide()
         self.status_label.setText("就绪 - 按 Control+Q 给下一步截图")
+        # DT-3 修复：轮次重置后立即写一份空 current_steps 的草稿覆盖磁盘上
+        # 可能残留的上一轮步骤，避免崩溃续采时与 rounds 已追加的本轮轨迹重复。
+        self._write_draft_now()
 
     def closeEvent(self, event):
-        """窗口关闭事件 — 确保未保存的数据在关闭前写入 JSON"""
-        # 如果有未保存的步骤数据，先保存当前轮次再整体写入 JSON
-        if len(self.steps) > 0 or len(self.rounds) > 0:
+        """窗口关闭事件 — 确保未保存的数据在关闭前写入 JSON，并释放快捷键/定时器"""
+        # 任何关闭路径都先解绑全局快捷键并停掉定时器，避免旧窗口残留为幽灵实例
+        self.cleanup_resources()
+
+        # 让主窗口不再持有正在销毁的本实例引用
+        init_win = self.init_window
+        if init_win is not None \
+                and getattr(init_win, "annotation_window", None) is self:
+            init_win.annotation_window = None
+
+        # 已通过“任务完成”正常落盘的，不再二次保存；仅中途关闭时做应急保存（保留草稿）
+        if self._edit_mode:
+            # 编辑已完成任务：关闭前把当前轮写回最终 JSON，绝不写/删草稿
+            if not self._final_data_saved:
+                try:
+                    self.save_edited_round(silent=True)
+                except Exception as e:
+                    print(f"编辑模式关闭前保存修改失败: {e}")
+            # 进入编辑时主窗口已被隐藏，关闭编辑器后必须恢复，否则应用没有任何可见窗口
+            # 注意：此处不能调用 self.close() 或 _return_to_init_menu()，否则会递归销毁自身
+            init_win = self.init_window
+            if init_win is not None:
+                init_win.show()
+                init_win.raise_()
+                init_win.activateWindow()
+        elif not self._final_data_saved \
+                and (len(self.steps) > 0 or len(self.rounds) > 0):
             try:
                 self._save_all_data_before_close()
             except Exception as e:
@@ -2797,4 +3335,9 @@ class AnnotationEditor(QMainWindow):
             self.init_window.show()
             self.init_window.raise_()
             self.init_window.activateWindow()
+            # 解绑快捷键/定时器并销毁本窗口，避免旧实例残留为幽灵窗口；
+            # 让主窗口不再持有本实例引用
+            if getattr(self.init_window, "annotation_window", None) is self:
+                self.init_window.annotation_window = None
         self.close()
+        self.deleteLater()

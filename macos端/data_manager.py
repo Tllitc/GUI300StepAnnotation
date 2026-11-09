@@ -6,6 +6,7 @@
 """
 
 import os
+import re
 import glob
 import json
 import platform
@@ -278,6 +279,64 @@ class DataManager:
         except Exception as e:
             print(f"加载草稿失败: {e}")
             return None
+
+    @staticmethod
+    def load_json_from_dir(gui_dir_path):
+        """
+        读取 gui_xxxxxx 目录下的最终 JSON（已完成任务）
+        :param gui_dir_path: gui_xxxxxx 目录完整路径
+        :return: (data_or_None, error_or_None)
+        """
+        if not gui_dir_path:
+            return None, "请选择 gui_xxxxxx 形式的任务目录"
+
+        dir_name = os.path.basename(os.path.normpath(gui_dir_path))
+        match = re.fullmatch(r"gui_(\d{6})", dir_name)
+        if not match:
+            return None, "请选择 gui_xxxxxx 形式的任务目录"
+
+        gui_number = match.group(1)
+        filepath = os.path.join(gui_dir_path, f"gui_{gui_number}.json")
+        if not os.path.exists(filepath):
+            return None, "该任务尚未完成，请使用『继续未完成任务』"
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return json.load(f), None
+        except Exception as e:
+            return None, f"任务 JSON 解析失败: {e}"
+
+    @staticmethod
+    def load_coords_from_dir(gui_dir_path):
+        """
+        读取 gui_xxxxxx 目录下的 coords JSON（coords 为可选项）
+        :param gui_dir_path: gui_xxxxxx 目录完整路径
+        :return: (entries_list, error_or_None)
+        """
+        if not gui_dir_path:
+            return [], "请选择 gui_xxxxxx 形式的任务目录"
+
+        dir_name = os.path.basename(os.path.normpath(gui_dir_path))
+        match = re.fullmatch(r"gui_(\d{6})", dir_name)
+        if not match:
+            return [], "请选择 gui_xxxxxx 形式的任务目录"
+
+        gui_number = match.group(1)
+        filepath = os.path.join(gui_dir_path, f"gui_{gui_number}_coords.json")
+        if not os.path.exists(filepath):
+            return [], None
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                coords = json.load(f)
+        except Exception as e:
+            return [], f"坐标文件解析失败: {e}"
+
+        if isinstance(coords, list):
+            return coords, None
+        if isinstance(coords, dict) and isinstance(coords.get("coords"), list):
+            return coords["coords"], None
+        return [], "坐标文件解析失败: 不支持的坐标格式"
 
     @staticmethod
     def find_draft_dirs(base_dir):
