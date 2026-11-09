@@ -92,12 +92,14 @@ def _make_dataset(gui_number):
 
     # coords 条目带 round（4.2/B4 落轮与编辑写回都会在序列化边界注入 round）：
     # INV-13 逐字段比对未编辑轮，夹具若缺 round 则会与写回结果差一个键而假红。
+    # 框中心必须与 JSON 的 coordinate/start_coordinate 自洽（INV-14）：
+    # 不自洽时编辑态会判定为 mismatch 而不采信该框，拖拽用例的现场就不成立了。
     coords0 = [
         {"step": 0, "action": "left_click", "round": 0,
          "vertices": [100, 200, 300, 400], "center": [200, 300]},
         {"step": 1, "action": "left_click_drag", "round": 0,
          "start_vertices": [10, 20, 40, 60], "start_center": [25, 40],
-         "end_vertices": [100, 120, 150, 180], "end_center": [110, 130]},
+         "end_vertices": [100, 120, 120, 140], "end_center": [110, 130]},
     ]
     coords1 = [
         {"step": 0, "action": "left_click", "round": 1,

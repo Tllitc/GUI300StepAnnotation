@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""数据一致性不变量断言（INV-1 ~ INV-13 的测试侧实现）。
+"""数据一致性不变量断言（INV-1 ~ INV-14 的测试侧实现）。
 
 这些函数只读取产品对象状态与磁盘文件，绝不修改产品数据；
 所有断言失败均以 AssertionError 抛出，并带上下文字段。
@@ -17,6 +17,13 @@ import re
 
 import pytest
 
+# INV-14 的 center ↔ coordinate 判定口径与产品写回守卫、离线修复脚本共用同一份
+# 实现（tools/coords_center_repair.py 只依赖标准库，不牵进 PyQt5），
+# 避免三处各写一遍比较逻辑后再次漂移。
+from tools.coords_center_repair import (COORD_CENTER_TOL, coord_pair,
+                                        entry_coordinate_mismatch,
+                                        step_action_info)
+
 
 SCREENSHOT_NAME_RE = re.compile(r"^gui_\d{6}_\d{4}\.png$")
 # INV-11：从截图名提取 4 位序号
@@ -26,6 +33,8 @@ SEQ_RE = re.compile(r"^gui_\d{6}_(\d{4})\.png$")
 # 必须与产品 validate_step_at 的 coord_actions 完全一致（含 scroll）——
 # 产品侧 _collect_coords_entries 的 coord_action_types 目前缺 scroll（B6），
 # 阶段 4.1 修复时产品两处须共用本常量口径，杜绝再次漂移。
+# INV-14（center ↔ coordinate）同样以本集合为适用范围：集合内的动作
+# 必须满足「框中心 == 交付坐标值」，集合外的动作不产生 coords 条目。
 COORD_ACTION_TYPES = frozenset({
     "left_click", "double_click", "triple_click", "right_click",
     "middle_click", "mouse_move", "left_click_drag", "type", "scroll",
@@ -254,15 +263,26 @@ def assert_draft(editor):
 # ---------------------------------------------------------------------------
 # INV-8 最终产物一致
 # ---------------------------------------------------------------------------
-def assert_final_json(editor, expected_rounds=None, fullscreen_refs=None):
+def assert_final_json(editor, expected_rounds=None, fullscreen_refs=None,
+                      center_exempt_refs=None):
     """INV-8: 读取 gui_XXXXXX.json 与 gui_XXXXXX_coords.json 并做交叉校验。
 
-    :param fullscreen_refs: 全屏截图豁免拉框的 (round_idx, step_idx) 集合。
+    :param fullscreen_refs: 豁免坐标类断言的 (round_idx, step_idx) 集合。
         产品 validate_step_at 对 selection_type == "fullscreen" 豁免坐标要求，
         _collect_coords_entries 也因 rect_info 为空而跳过这类步骤；但最终 JSON
         的 trajectory 条目不携带 selection_type，无法从盘上辨识，故须由调用方
         显式声明。默认 None 表示「本用例无全屏步」，此时坐标类动作必须条条有
         coords 条目。
+
+        该集合同时作为 INV-14（center ↔ coordinate）的豁免位：坐标值不存在或
+        盘上条目本身不被采信的步骤，应由用例显式列入而不是靠 INV-14 放过。
+        编辑态回归里「hydration 判定 absent（条目根本不存在）后写回仍无条目」
+        的步骤属于此类：覆盖层与中心层都要跳过，传 fullscreen_refs={(轮, 步)}。
+    :param center_exempt_refs: 只豁免 INV-14（中心层）的 (round_idx, step_idx)。
+        「hydration 判定 mismatch 后原样保留盘上条目」（A4）的步骤属于此类：
+        条目**必须**存在（覆盖层照常要求，否则丢框会被静默放过），但工具既不
+        造假也不丢数据，故意保留的 bbox 中心与已交付 coordinate 不一致，故须由
+        用例显式列入中心层豁免位，而不是连同覆盖层一起跳过。
     """
     gui_dir = _gui_dir(editor)
     json_path = os.path.join(gui_dir, f"gui_{editor.gui_number}.json")
@@ -298,7 +318,8 @@ def assert_final_json(editor, expected_rounds=None, fullscreen_refs=None):
         )
 
     total_steps = 0
-    coord_refs = []  # (round_idx, step_idx, action, screenshot)
+    # (round_idx, step_idx, action, screenshot, coordinate, start_coordinate)
+    coord_refs = []
     # 跨全部轮次的截图名 -> 首次出现的 (r_idx, s_idx)
     all_seen_shots = {}
     for r_idx, traj in enumerate(trajectories):
@@ -330,14 +351,18 @@ def assert_final_json(editor, expected_rounds=None, fullscreen_refs=None):
 
             actions = entry.get("actions") or []
             assert actions, f"INV-8: round {r_idx} step {s_idx} actions 为空"
-            coord_refs.append((r_idx, s_idx, actions[0].get("action", ""), shot))
+            action0 = actions[0]
+            coord_refs.append((r_idx, s_idx, action0.get("action", ""), shot,
+                               coord_pair(action0.get("coordinate")),
+                               coord_pair(action0.get("start_coordinate"))))
             total_steps += 1
 
     _fullscreen = set(fullscreen_refs or ())
+    _center_exempt = _fullscreen | set(center_exempt_refs or ())
     if coords is None:
         # 无 coords 文件却存在需要坐标的步骤 —— B6（scroll 顶点丢失）或
         # B41（空 coords 覆盖 / 未写出）的直接证据。
-        need = [(r, s, a) for (r, s, a, _shot) in coord_refs
+        need = [(r, s, a) for (r, s, a, _shot, _c, _sc) in coord_refs
                 if a in COORD_ACTION_TYPES and (r, s) not in _fullscreen]
         assert not need, (
             f"INV-8: coords 文件缺失，但存在 {len(need)} 个需要坐标的步骤：{need}"
@@ -349,6 +374,9 @@ def assert_final_json(editor, expected_rounds=None, fullscreen_refs=None):
         )
         assert_coords_entry_structure(coords)
         assert_coords_cover_refs(coords, coord_refs, fullscreen_refs=_fullscreen)
+        # INV-14：光有「条目存在」不够 —— 条目必须是属于这一步的框。
+        # 旧数据的位置冒领正是「覆盖层全绿、bbox 却属于别的步骤」的假绿。
+        assert_coords_center_match(coords, trajectories, fullscreen_refs=_center_exempt)
 
     return data, coords
 
@@ -410,11 +438,13 @@ def assert_coords_cover_refs(coords, coord_refs, fullscreen_refs=None):
     第一个 (step, action) 相同且未被消费的条目。跨轮同名 (step, action) 因此
     不会互相顶替。
 
-    :param coord_refs: [(round_idx, step_idx, action, screenshot), ...]
+    :param coord_refs: [(round_idx, step_idx, action, screenshot,
+                         coordinate, start_coordinate), ...]
+        后两项仅供 INV-14 使用，本函数不读。
     """
     skip = set(fullscreen_refs or ())
     expected = [
-        (r, s, a) for (r, s, a, _shot) in coord_refs
+        (r, s, a) for (r, s, a, _shot, _c, _sc) in coord_refs
         if a in COORD_ACTION_TYPES and (r, s) not in skip
     ]
     consumed = [False] * len(coords)
@@ -448,6 +478,83 @@ def assert_coords_cover_refs(coords, coord_refs, fullscreen_refs=None):
     assert not extra, (
         f"INV-8: coords 中存在 {len(extra)} 条无对应 trajectory 步骤的条目：{extra}"
     )
+
+
+# ---------------------------------------------------------------------------
+# INV-14 coords 框中心 ↔ 交付坐标值
+# ---------------------------------------------------------------------------
+def assert_coords_center_match(coords, trajectories, fullscreen_refs=None,
+                               where="coords"):
+    """INV-14: 每条 coords 的框中心必须等于同一步骤的交付 coordinate。
+
+    依据：产品坐标输入框只读，其值只能由 _init_editor_from_capture 以框中心
+    派生（x + w // 2）后原样写进 JSON。故对 COORD_ACTION_TYPES 的单框动作恒有
+    center == coordinate，left_click_drag 为 start_center == start_coordinate、
+    end_center == coordinate；奇数宽高向下取整，容差 COORD_CENTER_TOL（1px）。
+
+    为何需要单独一条不变量：INV-8 的覆盖层只断言「每个需要坐标的步骤都有
+    一条 coords」，从不比对中心，因此「hydration 按列表下标冒领别的步骤的
+    顶点」污染后的数据会假绿通过 —— 条目 step 编号正确、bbox 却属于别的
+    工作（gui_000005 交付时的 4 组重复 bbox 正是这一形态）。
+
+    定位口径：优先用条目 round 字段按 (round, step) 精确索引；旧交付件不含
+    round（B4），退回与 assert_coords_cover_refs 相同的有序消费口径（轮次升序
+    + 轮内 step 升序，取第一个 (step, action) 相符且未被消费的条目）。
+
+    :param trajectories: 最终 JSON 各 assistant 消息的 trajectory 列表（按轮顺序）
+    :param fullscreen_refs: 豁免的 (round_idx, step_idx) 集合，语义与
+        assert_final_json 同名参数一致（全屏步 / 故意原样保留的不一致条目）；
+        缺条目的步骤不在此重复报错，由 INV-8 覆盖层负责
+    """
+    skip = set(fullscreen_refs or ())
+    by_round_step = {}
+    legacy_entries = []
+    for entry in coords or []:
+        if not isinstance(entry, dict):
+            continue
+        rnd = entry.get("round")
+        step = entry.get("step")
+        if (isinstance(rnd, int) and not isinstance(rnd, bool)
+                and isinstance(step, int) and not isinstance(step, bool)):
+            by_round_step.setdefault((rnd, step), entry)
+        else:
+            legacy_entries.append(entry)
+
+    consumed = [False] * len(legacy_entries)
+    problems = []
+    for r_idx, traj in enumerate(trajectories or []):
+        for s_idx, step_data in enumerate(traj or []):
+            if (r_idx, s_idx) in skip:
+                continue
+            action, coordinate, start_coordinate = step_action_info(step_data)
+            if action not in COORD_ACTION_TYPES:
+                continue
+            entry = by_round_step.get((r_idx, s_idx))
+            if entry is None:
+                for j, candidate in enumerate(legacy_entries):
+                    if consumed[j] or candidate.get("action") != action:
+                        continue
+                    if candidate.get("step") == s_idx:
+                        entry = candidate
+                        consumed[j] = True
+                        break
+            if entry is None:
+                continue
+            mismatched, detail = entry_coordinate_mismatch(
+                entry, coordinate, start_coordinate, COORD_CENTER_TOL)
+            if mismatched:
+                problems.append(f"round {r_idx} step {s_idx}（{action}）：{detail}")
+
+    if problems:
+        raise AssertionError(
+            f"INV-14: {len(problems)} 条 {where} 条目的框中心与交付 coordinate 不一致：\n  "
+            + "\n  ".join(problems)
+            + "\n典型成因：旧版 load_from_completed_json 的位置回退（按列表下标取条目）"
+              "使编辑态步骤冒领了别的步骤的顶点，保存时又按正确 step 编号写盘；"
+              "或 B6 遗留（采集层缺 scroll 导致 coords 少条目、下标整体漂移）。"
+              "此类数据不会破坏 INV-8 的覆盖断言，必须由本不变量拦截；"
+              "修复手段：tools/coords_center_repair.py 做中心对齐重建。"
+        )
 
 
 # ---------------------------------------------------------------------------

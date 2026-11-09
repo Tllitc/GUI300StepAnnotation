@@ -265,13 +265,28 @@ def fill_step(editor, index, action_chinese="左键单击", intent="测试动作
         ed.intent_input.setText(intent)
 
     if coord_text is not None:
-        x, y = coord_text.split(",")
-        ed.coord_x_input.setText(x)
-        ed.coord_y_input.setText(y)
+        # 产品侧坐标框只读，值只能由 _init_editor_from_capture 按 x + w//2 /
+        # y + h//2 从框中心派生。setReadOnly 只挡用户输入、挡不住代码 setText，
+        # 在这里覆写就会造出「框中心 ≠ 交付 coordinate」这种真实采集不可能出现
+        # 的数据（正是 INV-14 要拦的形态），故改为断言期望值等于派生值。
+        x, y = [v.strip() for v in coord_text.split(",")]
+        assert ed.coord_x_input.text() == x, (
+            f"coord_text 与框派生的 X 不一致：期望 {x!r}，实际 {ed.coord_x_input.text()!r}"
+            "（rect_info 决定派生值，勿在夹具里手工造坐标）"
+        )
+        assert ed.coord_y_input.text() == y, (
+            f"coord_text 与框派生的 Y 不一致：期望 {y!r}，实际 {ed.coord_y_input.text()!r}"
+        )
     if end_coord_text is not None:
-        ex, ey = end_coord_text.split(",")
-        ed.end_coord_x_input.setText(ex)
-        ed.end_coord_y_input.setText(ey)
+        ex, ey = [v.strip() for v in end_coord_text.split(",")]
+        assert ed.end_coord_x_input.text() == ex, (
+            f"end_coord_text 与终点框派生的 X 不一致：期望 {ex!r}，"
+            f"实际 {ed.end_coord_x_input.text()!r}"
+        )
+        assert ed.end_coord_y_input.text() == ey, (
+            f"end_coord_text 与终点框派生的 Y 不一致：期望 {ey!r}，"
+            f"实际 {ed.end_coord_y_input.text()!r}"
+        )
 
     if action_key in ("type", "answer", "answer_terminate", "open_app", "open_url"):
         ed.text_input.setPlainText(text or "测试文本")
@@ -329,7 +344,8 @@ def walk_steps(editor, n, action_chinese="左键单击", intent_template="测试
         append_step(editor)
         fill_step(editor, i, action_chinese=action_chinese,
                   intent=intent_template.format(i=i + 1),
-                  coord_text="250,350")
+                  # Fake 默认单框 (100, 200, 300, 400) 的派生中心 = (250, 400)
+                  coord_text="250,400")
         confirm(editor)
     assert len(editor.steps) == n
     return editor.steps

@@ -60,6 +60,90 @@ SYSTEM_BUTTONS = [
 ]
 
 
+# ============================================================
+# coords 条目 ↔ 交付坐标一致性判定（跨端同集口径的本地镜像）
+# ============================================================
+# 与 Windows 侧 tools/coords_center_repair.py 共用同一容差常量与同一套三态
+# 返回语义（True 不一致 / False 一致 / None 无从比对），但**判定基准不同**：
+# 本端 _build_coords_entry 把 center 取自 JSON 坐标值、vertices 取自内存拉框，
+# 且坐标输入框允许手工改值，故 center 才是「条目归属哪一步」的凭证；Windows 侧
+# 坐标输入框只读、center 由框中心派生，才以 vertices 重算为准。
+# 本目录是独立分发件（无 tools/ 包），无法 import 上级脚本，只能就地镜像，
+# 调整容差或比对规则时两处须一并更新。
+COORD_CENTER_TOL = 1
+
+
+def _finite_int(value):
+    """严格取整：排除 bool / NaN / Inf / 非数值；不可用返回 None。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return int(value)
+
+
+def coord_pair(value):
+    """[x, y] → (int, int)；缺失/非数组/长度不足/含非数值一律 None。"""
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    x = _finite_int(value[0])
+    y = _finite_int(value[1])
+    if x is None or y is None:
+        return None
+    return (x, y)
+
+
+def is_zero_pair(pair):
+    """(0, 0) 在交付数据里等价于「没有可用坐标」，不作为比对基准。"""
+    return pair is not None and pair[0] == 0 and pair[1] == 0
+
+
+def entry_coordinate_mismatch(entry, coordinate=None, start_coordinate=None,
+                              tol=COORD_CENTER_TOL):
+    """单条 coords 条目与其所属步骤的坐标值比对。
+
+    :return: (result, detail)
+        result=True  不一致（或 center 不可解析），需要人工处置
+        result=False 一致
+        result=None  动作无需坐标 / 交付侧没有可用坐标值，无从比对（不算缺陷）
+        detail 为可直接展示给人看的差异说明
+    """
+    if not isinstance(entry, dict):
+        return True, "条目不是 JSON 对象"
+    action = entry.get("action")
+    if action not in COORD_ACTIONS:
+        return None, f"动作 {action!r} 无需坐标"
+
+    if action in SWIPE_ACTIONS:
+        # swipe/drag：center 对齐 start_coordinate，end_center 对齐 coordinate
+        axes = (("center", start_coordinate, entry.get("center")),
+                ("end_center", coordinate, entry.get("end_center")))
+    else:
+        axes = (("center", coordinate, entry.get("center")),)
+
+    reasons = []
+    checked = 0
+    for label, coord_value, center_value in axes:
+        center = coord_pair(center_value)
+        if center is None:
+            reasons.append(f"盘上 {label} 无法解析")
+            continue
+        target = coord_pair(coord_value)
+        if target is None or is_zero_pair(target):
+            continue
+        checked += 1
+        dx = abs(center[0] - target[0])
+        dy = abs(center[1] - target[1])
+        if dx > tol or dy > tol:
+            reasons.append(f"盘上 {label}={list(center)} / JSON coordinate={list(target)}"
+                           f"（偏差 {dx},{dy}px）")
+    if reasons:
+        return True, "；".join(reasons)
+    if not checked:
+        return None, f"{action} 在交付 JSON 中无可用坐标值，跳过比对"
+    return False, ""
+
+
 class ScreenshotCanvas(QFrame):
     """截图显示区域，支持鼠标拖拽绘制矩形框"""
 
@@ -788,6 +872,9 @@ class AnnotationEditor(QMainWindow):
         self._edit_round_index = 0
         self._coords_rounds = []     # 与 rounds 等长的坐标分组
         self._original_coords_exist = False
+        # hydration 检测出的「盘上 bbox 与 coordinate 不一致」清单：
+        # (步序, 动作中文名, issue, 差异详情)，编辑期间只读，不参与写回判定
+        self._coord_issues = []
         self._final_data_saved = False
 
         # 必填校验结果缓存（按步骤下标），输入变化后 300ms 防抖重算
@@ -1855,6 +1942,16 @@ class AnnotationEditor(QMainWindow):
                 os.path.join(self.gui_dir, filename)
                 if filename and self.gui_dir else ""
             )
+        # hydration 登记的「框丢失/框与坐标不一致」标记不属 _collect_step_data 的
+        # 五个键，不在这里回贴就会被一次普通导航抹掉，写回时的「保留盘上原条目」
+        # 分支（见 save_edited_round）随即失效；用户已重新拉到合法框则双双清空。
+        prev = self.steps_data[self.current_step]
+        if self._valid_vertices(step_data.get("vertices")) is not None:
+            step_data["coord_issue"] = None
+            step_data["orig_coord_entry"] = None
+        else:
+            step_data["coord_issue"] = prev.get("coord_issue")
+            step_data["orig_coord_entry"] = prev.get("orig_coord_entry")
         self.steps_data[self.current_step] = step_data
         self._invalidate_missing_slot(self.current_step)
 
@@ -2238,6 +2335,102 @@ class AnnotationEditor(QMainWindow):
 
     # ========== 必填校验（支持任意下标，供侧栏缺项标记与结束前全量校验）==========
 
+    @classmethod
+    def _find_coord_entry(cls, coords, step):
+        """在该轮 coords 中按 step 精确查找条目；未命中返回 None
+
+        旧写法在按 step 落空时回退取 round_coords[i]。位置相同不代表内容
+        相关——旧交付件 coords 少几条时下标整体漂移，编辑态由此冒领
+        别的工作的顶点，写回时把污染 bbox 以正确 step 编号落盘。位置猜测
+        不可挽救，彻底删除，改由 _find_coord_entry_by_center 做有根据的恢复。
+        step 取值沿用本端 _coord_step_of 的归一化口径（接受整浮点/数字串，
+        排除 bool）；无法确定步序时不做任何认领。
+        """
+        if step is None or not coords:
+            return None
+        for entry in coords:
+            if not isinstance(entry, dict):
+                continue
+            if cls._coord_step_of(entry) == step:
+                return entry
+        return None
+
+    @classmethod
+    def _find_coord_entry_by_center(cls, coords, action, coordinate,
+                                    start_coordinate, claimed_ids):
+        """按 center 恢复匹配：仅在 _find_coord_entry 落空后调用
+
+        兼容「step 编号整体漂移但条目本身正确」的旧数据：在尚未被其它步骤
+        认领的条目里找 action 相同、且 center 与 JSON 坐标逐轴差 ≤
+        COORD_CENTER_TOL 的那一条。命中的是对真实内容的验证，不是对列表位置的猜测。
+        """
+        if not coords:
+            return None
+        if action not in COORD_ACTIONS:
+            return None
+        for entry in coords:
+            if not isinstance(entry, dict) or id(entry) in claimed_ids:
+                continue
+            if entry.get("action") != action:
+                continue
+            mismatched, _detail = entry_coordinate_mismatch(
+                entry, coordinate, start_coordinate, COORD_CENTER_TOL)
+            # 只有「已验证一致」才认领；None（无可用坐标值）不足以证明归属
+            if mismatched is False:
+                claimed_ids.add(id(entry))
+                return entry
+        return None
+
+    @classmethod
+    def _classify_coord_state(cls, action_data, coord_entry):
+        """coords 条目 + JSON 坐标 → (vertices, coord_issue)
+
+        coord_issue ∈ {None, "absent", "mismatch", "no_box"}：
+          absent   交付 JSON 里该步有坐标值，coords 却没有可信的框 → 框丢失
+          mismatch 有条目但 center 与坐标值对不上（位置冒领的典型现场）→ 不采信
+          no_box   既没有框也没有坐标值 → 本就无框可还原
+        "absent"/"mismatch" 一律返回 vertices=None：宁可不显示框，也不让错误
+        bbox 在下次写回时以正确 step 编号落进已交付数据。
+        """
+        data = action_data if isinstance(action_data, dict) else {}
+        action = data.get("action")
+        coordinate = coord_pair(data.get("coordinate"))
+        start_coordinate = coord_pair(data.get("start_coordinate"))
+        raw_vertices = (coord_entry.get("vertices")
+                        if isinstance(coord_entry, dict) else None)
+        vertices = cls._valid_vertices(raw_vertices)
+
+        if action not in COORD_ACTIONS:
+            # 非坐标类动作：维持现状（有条目就带上，没有就 None）
+            return vertices, None
+
+        has_coord = (coordinate is not None and not is_zero_pair(coordinate)) \
+            or (start_coordinate is not None and not is_zero_pair(start_coordinate))
+        if vertices is None:
+            return None, ("absent" if has_coord else "no_box")
+        if has_coord:
+            mismatched, _detail = entry_coordinate_mismatch(
+                coord_entry, coordinate, start_coordinate, COORD_CENTER_TOL)
+            if mismatched:
+                return None, "mismatch"
+        return vertices, None
+
+    @classmethod
+    def _coord_issue_detail(cls, action_data, coord_entry):
+        """给汇总告警用的一行差异说明（盘上值 vs JSON 值，给人直接看的格式）"""
+        data = action_data if isinstance(action_data, dict) else {}
+        coordinate = coord_pair(data.get("coordinate"))
+        start_coordinate = coord_pair(data.get("start_coordinate"))
+        json_part = (f"JSON coordinate={list(coordinate)}" if coordinate
+                     else "JSON 无坐标值")
+        if not isinstance(coord_entry, dict):
+            return f"coords 无对应条目 / {json_part}"
+        mismatched, detail = entry_coordinate_mismatch(
+            coord_entry, coordinate, start_coordinate, COORD_CENTER_TOL)
+        if mismatched:
+            return detail
+        return f"coords 条目没有可用的框顶点 / {json_part}"
+
     def _step_snapshot(self, index):
         """获取某步骤的校验快照：当前编辑步且尚未落表时实时收集 UI 数据"""
         if index == self.current_step and self._current_screenshot_filename:
@@ -2281,6 +2474,14 @@ class AnnotationEditor(QMainWindow):
         live_vertices = self._valid_vertices(
             self._current_vertices if is_live else vertices
         )
+        # hydration 已判定该步「盘上框丢失/框与坐标值不一致」时不阻塞重拉框：
+        # 强迫重拉会连带改写已交付的 coordinate（与 Windows A6 同一取舍）；
+        # 该步的盘上条目由 save_edited_round 原样保留。is_live 时
+        # _step_snapshot 只回五个键，必须回查 steps_data 才拿得到标记。
+        stored = (self.steps_data[index]
+                  if 0 <= index < len(self.steps_data) else {})
+        inherited_box_lost = (isinstance(stored, dict)
+                              and stored.get("coord_issue") in ("absent", "mismatch"))
 
         # 坐标动作：需要 coordinate（scroll 同样要求先在首图拉框）
         if action in COORD_ACTIONS:
@@ -2295,7 +2496,7 @@ class AnnotationEditor(QMainWindow):
                 else:
                     has_start = self._valid_coord_pair(action_data.get("start_coordinate")) is not None
                     has_end = self._valid_coord_pair(action_data.get("coordinate")) is not None
-                if live_vertices is None:
+                if live_vertices is None and not inherited_box_lost:
                     reasons.append("缺少起点拉框")
                 if not has_start:
                     reasons.append("缺少起点坐标")
@@ -2308,7 +2509,7 @@ class AnnotationEditor(QMainWindow):
                     has_coord = self._is_valid_number(x) and self._is_valid_number(y)
                 else:
                     has_coord = self._valid_coord_pair(action_data.get("coordinate")) is not None
-                if live_vertices is None:
+                if live_vertices is None and not inherited_box_lost:
                     reasons.append("缺少拉框区域")
                 if not has_coord:
                     reasons.append("缺少坐标")
@@ -2689,6 +2890,8 @@ class AnnotationEditor(QMainWindow):
         # 用选中轮 trajectory 重建 steps_data
         self.steps_data = []
         missing_files = []
+        coord_issues = []
+        claimed_ids = set()   # 已被某一步认领的条目，防止按 center 恢复时重复占用
         if self.rounds:
             round_data = self.rounds[round_index]
             round_coords = self._coords_rounds[round_index]
@@ -2699,24 +2902,42 @@ class AnnotationEditor(QMainWindow):
                 if filename and not os.path.isfile(os.path.join(gui_dir, filename)):
                     missing_files.append(f"步骤 {i}: {filename}")
                 actions = traj.get("actions") or []
-                coord_entry = None
-                for entry in round_coords:
-                    if self._coord_step_of(entry) == self._coord_step_of(traj):
-                        coord_entry = entry
-                        break
-                if coord_entry is None and i < len(round_coords):
-                    coord_entry = round_coords[i]
+                action_data = copy.deepcopy(actions[0] if actions else {})
+                # 两趟匹配：先按 step 精确查，落空再按 center 在未认领条目里恢复。
+                # 不再有「按下标回退取第 i 条」——位置冒领会污染已交付 bbox。
+                coord_entry = self._find_coord_entry(
+                    round_coords, self._coord_step_of(traj))
+                if coord_entry is not None:
+                    claimed_ids.add(id(coord_entry))
+                else:
+                    coord_entry = self._find_coord_entry_by_center(
+                        round_coords, action_data.get("action"),
+                        coord_pair(action_data.get("coordinate")),
+                        coord_pair(action_data.get("start_coordinate")),
+                        claimed_ids)
+                vertices, coord_issue = self._classify_coord_state(
+                    action_data, coord_entry)
+                if coord_issue in ("absent", "mismatch"):
+                    coord_issues.append((
+                        i, action_cn_name(action_data.get("action")), coord_issue,
+                        self._coord_issue_detail(action_data, coord_entry)))
                 self.steps_data.append({
                     "screenshot": filename,
                     "screenshot_filepath": (
                         os.path.join(gui_dir, filename) if filename else ""
                     ),
                     "intent": traj.get("intent", ""),
-                    "action_data": copy.deepcopy(actions[0] if actions else {}),
-                    "vertices": copy.deepcopy(
-                        coord_entry.get("vertices") if coord_entry else None
-                    ),
+                    "action_data": action_data,
+                    "vertices": vertices,
+                    # 盘上 bbox 缺失/与已交付坐标不一致时保留原条目快照，供写回时
+                    # 原样继承（见 save_edited_round），绝不让「打开看一眼」丢数据
+                    "coord_issue": coord_issue,
+                    "orig_coord_entry": (
+                        copy.deepcopy(coord_entry)
+                        if coord_issue in ("absent", "mismatch")
+                        and isinstance(coord_entry, dict) else None),
                 })
+        self._coord_issues = coord_issues
 
         self._edit_mode = True
         self._draft_discarded = True
@@ -2744,9 +2965,29 @@ class AnnotationEditor(QMainWindow):
         self.setWindowTitle(
             f"GUI长步骤采标工具-iOS - {self.app_name}（编辑已完成任务）"
         )
-        self.status_label.setText(
-            f"编辑已完成任务 gui_{self.gui_number} · 第 {round_index + 1} 轮"
-        )
+        # 先于任何常规提示告警：不一致必须先被看见，否则采集员会以为框没拉到
+        if self._coord_issues:
+            lines = []
+            for step_index, action_cn, issue_kind, detail in self._coord_issues:
+                kind_cn = "框丢失" if issue_kind == "absent" else "框与坐标值不一致"
+                lines.append(f"步骤 {step_index}（{action_cn}）· {kind_cn}：{detail}")
+            QMessageBox.warning(
+                self,
+                "coords 与坐标值不一致",
+                "检测到以下步骤的 bbox 与已交付坐标值对不上：\n\n"
+                + "\n".join(lines)
+                + "\n\n这些步骤的框未载入，保存不会改动盘上原条目；"
+                  "如需修复请在原图重新拉框。"
+            )
+        edit_status = f"编辑已完成任务 gui_{self.gui_number} · 第 {round_index + 1} 轮"
+        if self._coord_issues:
+            # 保留常规状态串，只追加告警：直接覆盖会让其他依赖该文本的
+            # 现场提示（和后续测试）被顶掉
+            edit_status += (
+                f" · ⚠ 检测到 {len(self._coord_issues)} 个步骤的 "
+                f"bbox 与 coordinate 不一致"
+            )
+        self.status_label.setText(edit_status)
 
         if missing_files:
             QMessageBox.warning(
@@ -2849,7 +3090,19 @@ class AnnotationEditor(QMainWindow):
         coords = []
         for i, step in enumerate(self.steps_data):
             action_data = step.get("action_data") or {}
-            entry = {"step": i, "action": action_data.get("action", "")}
+            action = action_data.get("action", "")
+            orig = step.get("orig_coord_entry")
+            if (action in COORD_ACTIONS
+                    and self._valid_vertices(step.get("vertices")) is None
+                    and isinstance(orig, dict)):
+                # hydration 已判定该步「盘上框丢失/框与坐标值不一致」：既不伪造退化
+                # 点框，也不因“没框”丢条目，而是按当前步序重编号后原样保留盘上顶点
+                # （与 Windows A4 同口径），保证「打开看一眼就保存」不改变已交付 bbox
+                kept = copy.deepcopy(orig)
+                kept["step"] = i
+                coords.append(kept)
+                continue
+            entry = {"step": i, "action": action}
             vertices = self._valid_vertices(step.get("vertices"))
             start = self._valid_coord_pair(action_data.get("start_coordinate"))
             coord = self._valid_coord_pair(action_data.get("coordinate"))
@@ -2956,6 +3209,13 @@ class AnnotationEditor(QMainWindow):
         self.status_label.setText(
             f"已保存编辑 gui_{self.gui_number} · 第 {round_index + 1} 轮"
         )
+        if self._coord_issues:
+            # 继承性盘上缺陷本次未消除：写回成功不等于数据已干净，提醒显式处置
+            print(
+                f"提示：gui_{self.gui_number} 仍有 {len(self._coord_issues)} 个步骤的盘上 bbox 与 "
+                f"coordinate 不一致（本次原样保留、未改动这些条目）；"
+                f"如需修复请在原图重新拉框。"
+            )
 
         if silent:
             print(f"编辑模式关闭：已写回 gui_{self.gui_number}")
@@ -3432,6 +3692,9 @@ class AnnotationEditor(QMainWindow):
             self.steps_data = []
             self.coords_data = []
             self.rounds = []
+            # 全量重置：编辑态继承的盘上不一致清单不能跟着带进新任务，
+            # 否则写回时会拿着旧轮的清单打印误导性的剩余条数提示
+            self._coord_issues = []
             self.screenshot_cache = None
             self._current_screenshot_filename = None
             self._current_screenshot_filepath = None

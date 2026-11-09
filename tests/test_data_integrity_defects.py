@@ -735,7 +735,7 @@ class TestDI14:
         # 现场又长了两步：清场时这 5 页都得销毁，而不是只摘下来晾着
         for i in range(3, 5):
             H.append_step(editor)
-            H.fill_step(editor, i, coord_text="250,350")
+            H.fill_step(editor, i, coord_text="250,400")
             H.confirm(editor)
         assert len(editor.steps) == 5, f"用例前提不成立：{len(editor.steps)} 步"
         victims = [s["editor"] for s in editor.steps]
@@ -1062,7 +1062,7 @@ class TestDI5:
         """用户按要求给 scroll 拉了框，顶点必须如实出现在交付的 coords 里。"""
         idx = H.append_step(editor, rect=(100, 200, 300, 400))
         H.fill_step(editor, idx, action_chinese="滚动", intent="向下滚动列表",
-                    coord_text="250,350", pixels="300")
+                    coord_text="250,400", pixels="300")
         assert editor.validate_step_at(idx) == [], (
             f"scroll 步校验未通过，用例失去区分力："
             f"{editor.validate_step_at(idx)}"
@@ -1192,7 +1192,10 @@ class TestDI24:
         gui_dir = os.path.join(editor.data_manager.current_dir, f"gui_{gui}")
         os.makedirs(gui_dir, exist_ok=True)
 
-        def step(step_no, action, shot_no):
+        def step(step_no, action, shot_no, coordinate=None):
+            action_data = {"action": action}
+            if coordinate is not None:
+                action_data["coordinate"] = coordinate
             return {
                 "step": step_no,
                 "intent": f"{action} 第{step_no}步",
@@ -1202,7 +1205,7 @@ class TestDI24:
                     "active_window": "测试App",
                     "ui_tree_segment": "",
                 },
-                "actions": [{"action": action, "coordinate": [10 + shot_no, 20]}],
+                "actions": [action_data],
             }
 
         data = {
@@ -1212,10 +1215,14 @@ class TestDI24:
             "task_type": "Windows-测试",
             "messages": [
                 {"role": "user", "instruction": "第一轮指令"},
+                # coordinate 必须等于下面对应 coords 条目的框中心（INV-14），
+                # 否则 hydration 会判定 mismatch 而不采信该框，用例失去区分力
                 {"role": "assistant", "trajectory": [
-                    step(0, "left_click", 1), step(1, "left_click", 2)]},
+                    step(0, "left_click", 1, [200, 300]),
+                    step(1, "left_click", 2, [25, 40])]},
                 {"role": "user", "instruction": "第二轮指令"},
-                {"role": "assistant", "trajectory": [step(0, "left_click", 3)]},
+                {"role": "assistant", "trajectory": [
+                    step(0, "left_click", 3, [600, 700])]},
                 {"role": "user", "instruction": "第三轮指令"},
                 # 末轮只有无坐标语义的回答步 → coords 里根本没有它对应的条目，
                 # 于是「段数 2 ≠ 轮数 3」，旧格式下必须走轨迹签名对齐而非位置对应
