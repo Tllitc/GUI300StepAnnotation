@@ -3,7 +3,7 @@
 
 覆盖「在当前步后插入」（start_insert_capture / _on_screenshot_finished 插入分支）：
 - 5.1 中间插入后业务顺序与图步单射
-- 5.2 插入确认后 current_step 跳末尾（L2020）语义与随后追加
+- 5.2 插入确认后 current_step 只前进一格（2.8/B22）与随后走到末尾空位追加
 - 5.3 插入→删除新步→再插入的持续一致性
 - 5.4 插入截图在途期间删除锚点步（锚点失效场景）
 - 5.5 插入截图在途期间 undo_step / go_previous（capture_step 校验丢弃）
@@ -109,9 +109,9 @@ def test_insert_middle_keeps_business_order(editor_factory):
     assert_all(editor)
 
 
-# ===== SubTask 5.2：插入确认后 current_step 跳末尾，随后追加不乱序 =====
+# ===== SubTask 5.2：插入确认后只前进一格，随后追加不乱序 =====
 
-def test_insert_confirm_jumps_to_end_then_appends(editor_factory):
+def test_insert_confirm_advances_one_then_appends(editor_factory):
     editor = editor_factory()
     shots = make_three_steps(editor)
 
@@ -121,16 +121,28 @@ def test_insert_confirm_jumps_to_end_then_appends(editor_factory):
     editor.confirm_step()
     flush_events(50)
 
-    # L2020 语义：确认后 current_step 跳到 len（待截图空步）
-    assert editor.current_step == len(editor.steps_data) == 4
-    # 侧栏 4 条目、截图引用无重复、当前步在列表之外故无高亮条目
+    # 2.8（B22）：确认插入步后只前进一格（1 -> 2），不传送到末尾、不清空表单
+    assert editor.current_step == 2
+    assert len(editor.steps_data) == 4
+    # 现场已回填第 3 步：截图指针指向该步自己的图，而不是空位的 None
+    assert editor._current_screenshot_filename == editor.steps_data[2]["screenshot"]
+    assert editor.intent_input.text() == "S2"
+    # 侧栏 4 条目、截图引用无重复、高亮落在前进后的那一步
     assert len(editor.sidebar.item_widgets) == 4
     filenames = [s["screenshot"] for s in editor.steps_data]
     assert len(set(filenames)) == 4
-    assert highlighted_indexes(editor) == []
+    assert highlighted_indexes(editor) == [2]
     assert_all(editor)
 
-    # 随后普通截图走追加分支：新步落在末尾，已有顺序与引用不变
+    # 一路 go_next 走到末尾待截图空位（B22 后中间步确认不弹末尾，靠导航走到）
+    limit = len(editor.steps_data) + 2
+    while editor.current_step < len(editor.steps_data) and limit > 0:
+        editor.go_next()
+        flush_events()
+        limit -= 1
+    assert editor.current_step == len(editor.steps_data) == 4
+
+    # 末尾普通截图走追加分支：新步落在末尾，已有顺序与引用不变
     capture_and_wait(editor)
     fill_valid_step(editor, intent="S5")
     editor.confirm_step()
@@ -301,12 +313,20 @@ def test_insert_capture_failure_resets_anchor(editor_factory):
     assert_transient(editor)
     assert_all(editor)
 
-    # 确认当前（第 1 步）表单使 current_step 移到末尾
+    # 确认当前（第 1 步）表单：2.8（B22）后只前进一格，不再传送到末尾
     editor.confirm_step()
     flush_events(50)
+    assert editor.current_step == 1
+    assert len(editor.steps_data) == 3
+
+    # 走到末尾待截图空位后，普通截图走追加分支，不误入插入分支
+    limit = len(editor.steps_data) + 2
+    while editor.current_step < len(editor.steps_data) and limit > 0:
+        editor.go_next()
+        flush_events()
+        limit -= 1
     assert editor.current_step == len(editor.steps_data) == 3
 
-    # 随后普通截图走追加分支，不误入插入分支
     capture_and_wait(editor)
     fill_valid_step(editor, intent="S4")
     editor.confirm_step()

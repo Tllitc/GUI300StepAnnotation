@@ -282,12 +282,14 @@ def test_mutate_second_round_keeps_first_round_files_D8(editor, qapp, dialogs):
 def test_answer_cancel_instruction_dialog(editor, qapp, dialogs):
     """answer 切轮问答中模拟 QInputDialog 取消（input_ok=False）。
 
-    产品既有语义（读码确认，annotation_editor.py 2294/2315-2319）：
+    产品既有语义（读码确认：confirm_step 的 answer 分支 + _start_new_round）：
       - 取消时 _save_current_round_to_list 已经执行（在弹输入框之前），
         故当前轮已被消费进 rounds、steps_data 已清空；
-      - _start_new_round 走 else 分支，仅置状态文本“已取消新任务”，
-        不改 instruction、不重建任何状态、不关闭窗口、不清 rounds。
-    本测试固化该语义并核对 steps_data/rounds/草稿/磁盘均不损坏。
+      - _start_new_round 走 else 分支后调 _reset_workspace_after_cancel
+        （2.3/B28 修复：不能只改文案，否则画布/表单/步骤标签仍停在上一轮），
+        不改 rounds、不关闭窗口，并把当前轮指令置空（计划 2.6/B14）。
+    本测试固化该语义并核对 steps_data/rounds/草稿/磁盘均不损坏；
+    界面残留面的细化断言见 test_data_integrity.py::TestDI11。
     """
     walk_steps(editor, 2, action="click")
     capture(editor)
@@ -308,8 +310,9 @@ def test_answer_cancel_instruction_dialog(editor, qapp, dialogs):
     assert editor.current_step == 0
     assert editor._current_screenshot_filename is None
     assert "已取消新任务" in editor.status_label.text()
-    # 指令保持第一轮指令（未被空串/新值替换）
-    assert editor.task_instruction == "测试指令"
+    # B14：上一轮已随 answer 落轮并被消费，取消续轮后不得继续持有旧指令，
+    # 否则用户接着采集的整轮会被静默挂到上一条指令上（落轮前另有强校验兼做安全网）
+    assert editor.task_instruction == ""
 
     # 模型/磁盘/侧栏/草稿全套不变量：磁盘 0001~0003 仅由 rounds 引用，无孤儿
     assert_all(editor)

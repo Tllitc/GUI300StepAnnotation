@@ -352,9 +352,60 @@ class DataManager:
                 result.append(sub)
         return result
 
+    @staticmethod
+    def _atomic_write_json(filepath, payload, err_label="保存 JSON 失败"):
+        """
+        原子写 JSON：先写同目录隐藏临时文件，再 os.replace 换入目标
+        直接 open(path, "w") 会立即截断原文件，序列化中途失败（磁盘写满、
+        进程被杀、数据含不可序列化对象）就留下半截或空文件——已交付数据不可恢复。
+        tmp + replace 的失败语义是「原文件保持不动」，与上层「写入失败则原数据不变」一致。
+        :param filepath: 目标文件路径
+        :param payload: 待序列化的对象
+        :param err_label: 失败日志前缀
+        :return: 成功返回目标路径，失败返回 None
+        """
+        directory = os.path.dirname(filepath) or "."
+        tmp_path = os.path.join(directory, f".{os.path.basename(filepath)}.tmp")
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, filepath)
+            return filepath
+        except Exception as e:
+            print(f"{err_label}: {e}")
+            try:
+                if os.path.isfile(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            return None
+
+    def backup_final_json(self, gui_number):
+        """
+        编辑写回前把现存最终 JSON 复制为 gui_编号.json.bak（覆盖式安全网）
+        仅当源文件存在时才生成；复制失败只告警不阻断保存——备份是兜底，
+        不该因它写不进去而拒掉用户正常的修改落盘。
+        :param gui_number: GUI 编号
+        :return: 备份文件路径；无原文件或复制失败时返回 None
+        """
+        gui_dir = self.create_gui_directory(gui_number)
+        src = os.path.join(gui_dir, f"gui_{gui_number}.json")
+        if not os.path.isfile(src):
+            return None
+        dst = f"{src}.bak"
+        try:
+            import shutil
+            shutil.copy2(src, dst)
+            return dst
+        except Exception as e:
+            print(f"备份 JSON 失败: {e}")
+            return None
+
     def save_json_data(self, data, gui_number):
         """
-        保存 JSON 数据文件到对应的 gui_编号文件夹
+        保存 JSON 数据文件到对应的 gui_编号文件夹（tmp + os.replace 原子写）
         :param data: 字典数据
         :param gui_number: GUI 编号
         :return: 文件路径
@@ -364,13 +415,7 @@ class DataManager:
         filename = f"gui_{gui_number}.json"
         filepath = os.path.join(gui_dir, filename)
 
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            return filepath
-        except Exception as e:
-            print(f"保存 JSON 失败: {e}")
-            return None
+        return self._atomic_write_json(filepath, data, "保存 JSON 失败")
 
     def load_json_data(self, gui_number):
         """
@@ -392,7 +437,7 @@ class DataManager:
 
     def save_coords_json(self, coords_data, gui_number):
         """
-        保存拉框坐标信息到独立的 JSON 文件
+        保存拉框坐标信息到独立的 JSON 文件（tmp + os.replace 原子写）
         :param coords_data: 坐标数据列表，每个元素包含 step/action/vertices/center
         :param gui_number: GUI 编号
         :return: 文件路径或 None (失败时)
@@ -401,13 +446,7 @@ class DataManager:
         filename = f"gui_{gui_number}_coords.json"
         filepath = os.path.join(gui_dir, filename)
 
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(coords_data, f, ensure_ascii=False, indent=2)
-            return filepath
-        except Exception as e:
-            print(f"保存坐标 JSON 失败: {e}")
-            return None
+        return self._atomic_write_json(filepath, coords_data, "保存坐标 JSON 失败")
 
     def get_screen_info(self):
         """

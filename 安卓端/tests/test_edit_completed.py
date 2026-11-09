@@ -7,6 +7,7 @@
 - 编辑第 r 轮保存后仅该轮变化，coords 仍为 {"version":"3.0","coords":[...]}
 - 编辑模式不写 draft、关闭窗口自动写回
 - 缺项校验阻止保存且原文件不变
+- coords 少条目/step 漂移/center 与坐标值对不上（E 跨端同步：位置回退已删除）
 """
 import copy
 import json
@@ -18,6 +19,7 @@ from annotation_editor import AnnotationEditor
 from data_manager import DataManager
 from fakes import FakeAndroidScreenCapture
 from helpers import flush_events
+from invariants import assert_edit_writeback_preserved, assert_final_json
 
 GUI_NUM = "000001"
 
@@ -98,6 +100,62 @@ def _build_dataset(base_dir):
 def _read_json(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _build_raw_dataset(base_dir, steps, coords_entries):
+    """单轮数据集：coords 条目由用例逐字给定
+
+    与 _build_dataset 的区别是坐标不被自动派生，用于构造「少一条 scroll 条目」
+    「step 编号整体漂移」「center 与坐标值对不上」这类历史交付件。
+
+    :param steps: [(intent, action_data), ...]
+    :return: (gui_dir, data, coords_entries)
+    """
+    gui_dir = os.path.join(str(base_dir), f"gui_{GUI_NUM}")
+    os.makedirs(gui_dir, exist_ok=True)
+
+    trajectory = []
+    for j, (intent, action_data) in enumerate(steps):
+        filename = f"gui_{GUI_NUM}_{j + 1:04d}.png"
+        _write_png(os.path.join(gui_dir, filename), j + 1)
+        trajectory.append({
+            "step": j,
+            "intent": intent,
+            "CoT": "原始思维链",
+            "observation": {
+                "screenshot": filename,
+                "active_window": "",
+                "ui_tree_segment": "",
+                "extra_obs": "keep",
+            },
+            "actions": [copy.deepcopy(action_data)],
+        })
+    data = {
+        "platform": "Android",
+        "system": "Android 13",
+        "screen_size": [360, 640],
+        "task_type": "Android-社交",
+        "extra_meta": {"keep": True},
+        "messages": [
+            {"role": "user", "instruction": "唯一轮指令"},
+            {"role": "assistant", "trajectory": trajectory},
+        ],
+    }
+    with open(os.path.join(gui_dir, f"gui_{GUI_NUM}.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(gui_dir, f"gui_{GUI_NUM}_coords.json"), "w", encoding="utf-8") as f:
+        json.dump({"version": "3.0", "coords": coords_entries}, f,
+                  ensure_ascii=False, indent=2)
+    return gui_dir, data, coords_entries
+
+
+def _click_step(intent="点击搜索", coordinate=(100, 200)):
+    return intent, {"action": "click", "coordinate": list(coordinate), "element": ""}
+
+
+def _scroll_step(intent="上滑列表", coordinate=(300, 400)):
+    return intent, {"action": "scroll", "coordinate": list(coordinate),
+                    "pixels": -120, "element": ""}
 
 
 def _new_editor(base_dir, gui_dir, data, round_index=0):
@@ -224,13 +282,15 @@ def test_edit_round_two_save_only_replaces_selected_round(tmp_path, qapp, modal)
     assert coord_data.get("version") == "3.0"
     entries = coord_data["coords"]
     assert len(entries) == 5
-    assert entries[:3] == coords_entries[:3], "未编辑轮次坐标发生变化"
-    assert entries[3]["step"] == 0
-    assert entries[3]["action"] == "click"
-    assert entries[3]["vertices"] == [10, 20, 110, 220]
-    assert entries[3]["center"] == [50, 60]
-    assert entries[3]["source"] == "coords-v1"
-    assert "round" not in entries[3], "Android coords 不应添加 round 字段"
+    # 4.2（B4/B18）写盘副本按所属轮次注入 round；去掉 round 后其余字段逐字段不变
+    assert [e.get("round") for e in entries] == [0, 0, 0, 1, 1]
+    stripped = [{k: v for k, v in e.items() if k != "round"} for e in entries]
+    assert stripped[:3] == coords_entries[:3], "未编辑轮次坐标发生变化"
+    assert stripped[3]["step"] == 0
+    assert stripped[3]["action"] == "click"
+    assert stripped[3]["vertices"] == [10, 20, 110, 220]
+    assert stripped[3]["center"] == [50, 60]
+    assert stripped[3]["source"] == "coords-v1"
 
 
 def test_edit_mode_never_writes_draft_and_close_autosaves(tmp_path, qapp):
@@ -261,6 +321,163 @@ def test_edit_mode_never_writes_draft_and_close_autosaves(tmp_path, qapp):
     assert saved["messages"][1]["trajectory"][0]["intent"] == "草稿隔离意图"
     assert saved["messages"][3] == data["messages"][3], "未编辑轮次发生变化"
     assert saved["extra_meta"] == data["extra_meta"]
+
+
+def test_legacy_coords_missing_scroll_entry_does_not_steal_neighbor_box(tmp_path, qapp, modal):
+    """coords 少一条 scroll 条目（B6 遗留形态）：编辑态绝不冒领邻居步的框。
+
+    旧版 _find_coord_entry 在按 step 落空时回退取「该轮第 i 条」，条目数与步数
+    一旦错位，下标就漂到别的工作上，写回时污染 bbox 以正确 step 编号落盘。
+    现在只按 step 精确匹配，落空才按 center 验证恢复，两者都落空即判「框丢失」。
+
+    与 Windows 端的写回差异：本端 INV-7 要求 coords 每步恰好一条，故 absent 步
+    产出由已交付 coordinate 派生的退化点框——它不来自任何邻居的顶点，与「冒领」
+    是两回事。
+    """
+    steps = [_click_step(), _scroll_step()]
+    entries = [{"step": 0, "action": "click", "vertices": [40, 140, 160, 260],
+                "center": [100, 200], "source": "coords-v1"}]
+    gui_dir, data, _ = _build_raw_dataset(tmp_path, steps, entries)
+    editor = _load_editor(tmp_path, gui_dir, data, entries, round_index=0)
+    try:
+        assert len(editor.steps_data) == 2
+        assert editor.steps_data[0]["vertices"] == [40, 140, 160, 260]
+        assert editor.steps_data[0]["coord_issue"] is None
+        # scroll 步：盘上没有属于它的条目 → 框不载入，坐标值仍如实来自 JSON
+        assert editor.steps_data[1]["vertices"] is None
+        assert editor.steps_data[1]["action_data"]["coordinate"] == [300, 400]
+        assert editor.steps_data[1]["coord_issue"] == "absent"
+        assert editor.steps_data[1]["orig_coord_entry"] is None
+        assert [issue for _i, _a, issue, _d in editor._coord_issues] == ["absent"]
+        assert editor._coord_issues[0][0] == 1
+        # 不一致必须先被看见：模态框 + 状态栏双通道
+        assert any(title == "coords 与坐标值不一致" for title, _t in modal.warnings)
+        assert "bbox 与 coordinate 不一致" in editor.status_label.text()
+        # 丢框步不得阻塞保存：强迫重拉框会连带改写已交付的 coordinate（同 Windows A6）
+        assert editor.validate_step_at(1) == []
+
+        # 一次普通导航不能抹掉标记：标记不属 _collect_step_data 的五个键，
+        # 不回贴则落表后被顶掉，写回时「保留盘上原条目」分支随即失效
+        editor.jump_to_step(1)
+        flush_events()
+        editor.jump_to_step(0)
+        flush_events()
+        assert editor.steps_data[1]["coord_issue"] == "absent"
+        assert editor.steps_data[1]["orig_coord_entry"] is None
+
+        assert editor.save_edited_round(False) is True
+        flush_events(50)
+    finally:
+        try:
+            editor.close()
+        except Exception:
+            pass
+
+    _after, saved = assert_edit_writeback_preserved(gui_dir, GUI_NUM, data, entries, 0)
+    assert [e["step"] for e in saved] == [0, 1]
+    # 唯一真实的 step0 条目逐字段不变
+    assert saved[0] == {**entries[0], "round": 0}
+    # 未冒领：除 step0 外没有任何条目带着 step0 的顶点
+    assert saved[1]["vertices"] == [300, 400, 300, 400]
+    assert saved[1]["center"] == [300, 400]
+    assert [e for e in saved[1:] if e.get("vertices") == entries[0]["vertices"]] == []
+    assert_final_json(gui_dir, GUI_NUM)
+
+
+def test_legacy_entry_step_drift_recovered_by_center(tmp_path, qapp, modal):
+    """step 编号漂移但框本身正确：按 center 恢复匹配必须把框认回来。
+
+    旧交付件里 coords 条目的 step 可能整体错位，但「同 action 且 center == 已交付
+    coordinate」是对真实内容的验证，不是对列表位置的猜测，应恢复载入而非判成丢框。
+
+    漂移条目排在同 step 的正确条目之后：_find_coord_entry 不看 action、首个 step
+    命中即认领，若排在前面会把正确条目挤掉，真正归属该条目的步骤反而无据可查。
+
+    条目显式带 round=0：INV-13 在缺 round 时靠「step 变小就换轮」分组，而本用例的
+    step 恰好故意漂移（0/1/0），不标 round 会被它误读成两轮，与要验的东西无关。
+    """
+    steps = [_click_step(), _click_step("点击输入框", (60, 500)), _scroll_step()]
+    entries = [
+        {"step": 0, "action": "click", "round": 0,
+         "vertices": [40, 140, 160, 260], "center": [100, 200], "source": "coords-v1"},
+        {"step": 1, "action": "click", "round": 0,
+         "vertices": [10, 480, 110, 520], "center": [60, 500], "source": "coords-v1"},
+        # scroll 的框真实存在，step 却被写成 0（整体漂移）
+        {"step": 0, "action": "scroll", "round": 0,
+         "vertices": [250, 350, 350, 450], "center": [300, 400], "source": "coords-v1"},
+    ]
+    gui_dir, data, _ = _build_raw_dataset(tmp_path, steps, entries)
+    editor = _load_editor(tmp_path, gui_dir, data, entries, round_index=0)
+    try:
+        assert editor.steps_data[0]["vertices"] == [40, 140, 160, 260]
+        assert editor.steps_data[1]["vertices"] == [10, 480, 110, 520]
+        # 漂移条目按 center 被 step 2 认领，不产生任何告警
+        assert editor.steps_data[2]["vertices"] == [250, 350, 350, 450]
+        assert editor.steps_data[2]["coord_issue"] is None
+        assert editor.steps_data[2]["orig_coord_entry"] is None
+        assert editor._coord_issues == []
+        assert "bbox 与 coordinate 不一致" not in editor.status_label.text()
+        assert not any(title == "coords 与坐标值不一致" for title, _t in modal.warnings)
+
+        assert editor.save_edited_round(True) is True
+        flush_events(20)
+    finally:
+        try:
+            editor.close()
+        except Exception:
+            pass
+
+    _after, saved = assert_edit_writeback_preserved(gui_dir, GUI_NUM, data, entries, 0)
+    assert len(saved) == 3
+    scroll_entry = saved[2]
+    # 恢复成功即走正常写回：条目按真实步序重编号，顶点逐字段不变
+    assert scroll_entry["step"] == 2 and scroll_entry["action"] == "scroll"
+    assert scroll_entry["vertices"] == [250, 350, 350, 450]
+    assert scroll_entry["center"] == [300, 400]
+    assert_final_json(gui_dir, GUI_NUM)
+
+
+def test_center_mismatch_not_loaded_and_disk_entry_preserved(tmp_path, qapp, modal):
+    """框中心与坐标值对不上：不采信该框，但盘上原条目一个字节都不改。
+
+    「不采信」不等于「丢弃」—— save_edited_round 的保留分支让写回按当前步序原样
+    继承该条目，避免采集员只是打开看了一眼就永久丢掉已交付的顶点；validate_step_at
+    的窄豁免则保证历史缺陷不阻塞本轮保存（本轮新写的框若不一致仍会走缺项校验）。
+    """
+    steps = [_click_step(), _scroll_step()]
+    click_entry = {"step": 0, "action": "click", "vertices": [40, 140, 160, 260],
+                   "center": [100, 200], "source": "coords-v1"}
+    # 盘上 bbox 属于别的工作：center [100,200] 与交付 coordinate [300,400] 差数百像素
+    bad_scroll = {"step": 1, "action": "scroll", "vertices": [40, 140, 160, 260],
+                  "center": [100, 200], "source": "coords-v1"}
+    entries = [click_entry, bad_scroll]
+    gui_dir, data, _ = _build_raw_dataset(tmp_path, steps, entries)
+    editor = _load_editor(tmp_path, gui_dir, data, entries, round_index=0)
+    try:
+        assert editor.steps_data[0]["coord_issue"] is None
+        assert editor.steps_data[1]["vertices"] is None
+        assert editor.steps_data[1]["coord_issue"] == "mismatch"
+        assert editor.steps_data[1]["orig_coord_entry"] == bad_scroll
+        assert [issue for _i, _a, issue, _d in editor._coord_issues] == ["mismatch"]
+        assert any(title == "coords 与坐标值不一致" for title, _t in modal.warnings)
+        # mismatch 步既不阻塞保存，也不得凭空造出一个冒领来的框
+        assert editor.validate_step_at(1) == []
+
+        # 只改第一步的动作描述：不碰 mismatch 步，也不重新拉框
+        editor.intent_input.setText("只改动作描述")
+        assert editor.save_edited_round(False) is True
+        flush_events(50)
+    finally:
+        try:
+            editor.close()
+        except Exception:
+            pass
+
+    after, saved = assert_edit_writeback_preserved(gui_dir, GUI_NUM, data, entries, 0)
+    assert saved[0] == {**click_entry, "round": 0}, "正常条目被连带改写"
+    assert saved[1] == {**bad_scroll, "round": 0}, "继承性缺陷条目被改写或丢弃"
+    assert after["messages"][1]["trajectory"][0]["intent"] == "只改动作描述"
+    assert_final_json(gui_dir, GUI_NUM)
 
 
 def test_missing_fields_block_save_without_touching_json(tmp_path, qapp, modal):

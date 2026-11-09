@@ -44,21 +44,39 @@ class DialogController:
     """模态对话框应答控制器（无人值守）。
 
     默认：question -> Yes；warning/information/critical/about -> None；
-    QInputDialog.getText -> (预设文本, True)。
+    QInputDialog.getText -> (next_instruction, getText_result_ok)。
 
     测试通过 dialogs fixture 临时改写：
         ctrl.question_result = QMessageBox.No
         ctrl.input_ok = False                # ("", False)
-        ctrl.next_instruction = "..."
+        ctrl.next_instruction = "..."        # 下一轮任务指令
     """
 
     def __init__(self):
         self.question_result = QMessageBox.Yes
-        self.next_instruction = "第二轮新指令"
         self.input_ok = True
-        self.getText_result_text = "输入文本"
         self.getText_result_ok = True
+        # next_instruction 与 getText_result_text 共用一份后备存储：二者互为别名，
+        # 任一赋值都会改变 QInputDialog.getText 的返回值（T8：早期 get_text 只读
+        # getText_result_text，导致 next_instruction 是永不生效的死字段）。
+        self._instruction = "第二轮新指令"
         self.calls = []  # 记录调用：[("question", title, text), ...]
+
+    @property
+    def next_instruction(self):
+        return self._instruction
+
+    @next_instruction.setter
+    def next_instruction(self, value):
+        self._instruction = value
+
+    @property
+    def getText_result_text(self):
+        return self._instruction
+
+    @getText_result_text.setter
+    def getText_result_text(self, value):
+        self._instruction = value
 
     def question(self, parent=None, title="", text="", *args, **kwargs):
         self.calls.append(("question", title, text))
@@ -83,7 +101,7 @@ class DialogController:
     def get_text(self, parent=None, title="", label="", *args, **kwargs):
         self.calls.append(("getText", title, label))
         if self.input_ok:
-            return self.getText_result_text, True
+            return self._instruction, bool(self.getText_result_ok)
         return "", False
 
 
@@ -102,6 +120,10 @@ def qapp():
 @pytest.fixture
 def dm(tmp_path):
     """function 级 DataManager，current_dir 指向独立临时目录。"""
+    return _make_data_manager(tmp_path)
+
+
+def _make_data_manager(tmp_path):
     manager = DataManager(base_dir=str(tmp_path))
     manager.create_task_directory("windows", "test", "测试App")
     return manager
@@ -129,49 +151,70 @@ def auto_dialogs(dialogs):
 
 
 @pytest.fixture
-def editor(qapp, dm, dialogs, monkeypatch):
-    """function 级真实 AnnotationEditor。
+def editor_factory(qapp, dialogs, monkeypatch, tmp_path):
+    """AnnotationEditor 工厂（对齐安卓端 editor_factory 的 make(auto_init=...) 形态）。
 
-    - 使用临时 DataManager；
-    - 构造后调用 get_next_gui_number 并 create_gui_directory 初始化目录；
-    - 用 FakeScreenshotCaptureWindow 替换 annotation_editor 模块级 ScreenshotCaptureWindow；
-    - yield 后关闭并 deleteLater。
+    续采类用例需要在同一测试内构造第二个编辑器读取同一份草稿，故：
+      - make() 缺省时每次新建一个指向同一 tmp_path 的 DataManager；
+      - make(dm=...) 复用既有 DataManager（editor fixture 用它保持与 dm 的关联）；
+      - make(auto_init=False) 不预分配 gui_number / 不建任务目录（用于「构造即校验
+        尚未落盘」的场景）。
+    teardown 统一 cleanup_resources + close + deleteLater，并在 close 之间推进事件
+    循环，避免已析构对象被在途 singleShot 命中。
     """
-    # 模块级替换：annotation_editor.py 内 `from screenshot_capture import ScreenshotCaptureWindow`
-    # 之后所有对 ScreenshotCaptureWindow 的引用都指向 Fake
-    fake_cls = FakeScreenshotCaptureWindow
-    monkeypatch.setattr(_ae, "ScreenshotCaptureWindow", fake_cls)
+    # 模块级替换：annotation_editor.py 内 `from screenshot_capture import
+    # ScreenshotCaptureWindow` 之后所有引用都指向 Fake
+    monkeypatch.setattr(_ae, "ScreenshotCaptureWindow", FakeScreenshotCaptureWindow)
 
-    ed = AnnotationEditor(
-        data_manager=dm,
-        app_name="测试App",
-        task_instruction="测试指令：在测试App中完成一件事",
-        screen_info={"platform": "Windows", "system": "Windows 11", "screen_size": [1920, 1080]},
-        app_type="测试",
-        hotkey_listener=None,
-        init_window=None,
-    )
-    # 产品代码里 gui_number 为 None 时延迟在首次截图分配；这里我们提前分一个，
-    # 方便草稿/轮次等测试在截图前也能产生正确路径。
-    ed.gui_number = dm.get_next_gui_number()
-    dm.create_gui_directory(ed.gui_number)
+    editors = []
 
-    ed._test_dialogs = dialogs
+    def make(dm=None, app_name="测试App",
+             task_instruction="测试指令：在测试App中完成一件事",
+             app_type="测试", screen_info=None, auto_init=True):
+        manager = dm if dm is not None else _make_data_manager(tmp_path)
+        ed = AnnotationEditor(
+            data_manager=manager,
+            app_name=app_name,
+            task_instruction=task_instruction,
+            screen_info=screen_info or {
+                "platform": "Windows", "system": "Windows 11",
+                "screen_size": [1920, 1080],
+            },
+            app_type=app_type,
+            hotkey_listener=None,
+            init_window=None,
+        )
+        # 产品代码里 gui_number 为 None 时延迟在首次截图分配；这里默认提前分一个，
+        # 方便草稿/轮次等测试在截图前也能产生正确路径。
+        if auto_init:
+            ed.gui_number = manager.get_next_gui_number()
+            manager.create_gui_directory(ed.gui_number)
 
-    qapp.processEvents()
-    yield ed
-
-    ed.cleanup_resources()
-    try:
-        if not ed._is_closing:
-            ed.close()
-    except RuntimeError:
-        pass
-    try:
-        ed.deleteLater()
-    except Exception:
-        pass
-    try:
+        ed._test_dialogs = dialogs
+        editors.append(ed)
         qapp.processEvents()
-    except Exception:
-        pass
+        return ed
+
+    yield make
+
+    for ed in editors:
+        ed.cleanup_resources()
+        try:
+            if not ed._is_closing:
+                ed.close()
+        except RuntimeError:
+            pass
+        try:
+            ed.deleteLater()
+        except Exception:
+            pass
+        try:
+            qapp.processEvents()
+        except Exception:
+            pass
+
+
+@pytest.fixture
+def editor(editor_factory, dm):
+    """function 级真实 AnnotationEditor（基于 editor_factory，与 dm 同源）。"""
+    return editor_factory(dm=dm)
