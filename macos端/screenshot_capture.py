@@ -8,7 +8,7 @@
 import sys
 from PyQt5.QtWidgets import QApplication, QWidget, QRubberBand
 from PyQt5.QtCore import Qt, QRect, pyqtSignal, QSize
-from PyQt5.QtGui import QPainter, QPen, QColor, QPixmap, QScreen
+from PyQt5.QtGui import QPainter, QPen, QColor, QPixmap, QScreen, QFont
 
 
 class ScreenshotCaptureWindow(QWidget):
@@ -17,8 +17,11 @@ class ScreenshotCaptureWindow(QWidget):
     # 信号：当用户完成选择时发出，包含截图和坐标信息
     capture_completed = pyqtSignal(object, object, tuple, str)  # (original_pixmap, marked_pixmap, (x, y, width, height), screenshot_type)
     
-    def __init__(self):
+    def __init__(self, background_pixmap=None):
         super().__init__()
+        
+        # 背景图模式：给定截图时不抓屏，直接在该图上重新拉框（None = 原有全屏抓屏行为）
+        self.background_pixmap = background_pixmap
         
         # 设置为全屏、无边框、置顶。
         # macOS 上必须使用 Qt.Tool：Qt 会据此创建 QNSPanel（NSPanel 子类），
@@ -32,11 +35,13 @@ class ScreenshotCaptureWindow(QWidget):
         screen = QApplication.primaryScreen()
         self.screen_geometry = screen.geometry()
         
-        # 设置窗口大小为整个屏幕
-        self.setGeometry(self.screen_geometry)
+        # 设置窗口大小为整个屏幕（背景图模式的窗口几何由 _setup_background 接管）
+        if self.background_pixmap is None:
+            self.setGeometry(self.screen_geometry)
         
         # 截图相关变量
         self.full_pixmap = None
+        self.scale_factor = 1.0
         self.rubber_band = QRubberBand(QRubberBand.Rectangle, self)
         self.origin = None
         self.current_rect = None
@@ -61,9 +66,31 @@ class ScreenshotCaptureWindow(QWidget):
         # 设置鼠标指针为十字
         self.setCursor(Qt.CrossCursor)
 
-        # 捕获截图
-        self.capture_screen()
-        
+        # 捕获截图 / 装载背景图
+        if self.background_pixmap is not None:
+            self._setup_background()
+        else:
+            self.capture_screen()
+
+    def _setup_background(self):
+        """原图重新拉框模式：不抓屏，把背景设为指定截图，窗口尺寸 = 缩放后的显示尺寸"""
+        avail = QApplication.primaryScreen().availableGeometry()
+        pm = self.background_pixmap
+        ratio = min(avail.width() / pm.width(), avail.height() / pm.height(), 1.0)
+        disp_w = max(1, int(pm.width() * ratio))
+        disp_h = max(1, int(pm.height() * ratio))
+        self.full_pixmap = pm.scaled(disp_w, disp_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # 逻辑坐标系与显示图尺寸一致，offset 恒为 0
+        self.screen_geometry = QRect(0, 0, self.full_pixmap.width(), self.full_pixmap.height())
+        self.setGeometry(
+            avail.x() + (avail.width() - self.full_pixmap.width()) // 2,
+            avail.y() + (avail.height() - self.full_pixmap.height()) // 2,
+            self.full_pixmap.width(), self.full_pixmap.height(),
+        )
+        # 原图像素 / 显示图逻辑像素 —— 与抓屏模式同口径（乘 sf 得原图像素）
+        self.scale_factor = pm.width() / self.full_pixmap.width()
+        self.setStyleSheet("background-color: rgba(0, 0, 0, 180);")
+
     def capture_screen(self):
         """捕获整个屏幕"""
         screen = QApplication.primaryScreen()
@@ -81,8 +108,10 @@ class ScreenshotCaptureWindow(QWidget):
         super().showEvent(event)
         self.setFocus()
         self.activateWindow()
-        # 提升窗口层级至 macOS 菜单栏之上，使顶部菜单栏区域也可以拉框
-        self._raise_window_above_system_ui()
+        # 提升窗口层级至 macOS 菜单栏之上，使顶部菜单栏区域也可以拉框。
+        # 背景图（重新拉框）模式是居中的普通弹窗，无需压过系统菜单栏，跳过提升。
+        if self.background_pixmap is None:
+            self._raise_window_above_system_ui()
 
     def _raise_window_above_system_ui(self):
         """将截图面板提升到 macOS 主菜单栏/Dock 之上，并配置为非激活面板。
@@ -204,6 +233,13 @@ class ScreenshotCaptureWindow(QWidget):
                 elif self.current_rect and not self.click_only:
                     painter.drawRect(self.current_rect)
         
+        # 背景图模式：顶部操作提示
+        if self.background_pixmap is not None:
+            painter.setPen(QColor(255, 255, 255))
+            painter.setFont(QFont("Helvetica Neue", 11, QFont.Bold))
+            painter.drawText(QRect(0, 4, self.width(), 26), Qt.AlignHCenter,
+                             "在原图上重新拉框：拖框选区 → Cmd+S 确认 → Esc 取消/清空重画")
+        
         super().paintEvent(event)
     
     def mousePressEvent(self, event):
@@ -283,6 +319,11 @@ class ScreenshotCaptureWindow(QWidget):
         sf = self.scale_factor
         
         if not self.has_selection or not self.selection_rect:
+            if self.background_pixmap is not None:
+                # 原图模式：空选区等同于取消，禁止退化成"全屏截图"
+                self.capture_completed.emit(None, None, (), "cancelled")
+                self.close()
+                return
             if self.full_pixmap:
                 original_pixmap = QPixmap(self.full_pixmap)
                 marked_pixmap = QPixmap(self.full_pixmap)

@@ -80,9 +80,12 @@ def _make_dataset(gui_number, with_round_field=False):
     coords0 = [
         {"step": 0, "action": "left_click",
          "vertices": [100, 200, 300, 400], "center": [200, 300]},
+        # 顶点必须与 center / JSON coordinate 满足 Product 口径 center = x + w//2
+        # （INV-14：框中心 == coordinate）。编辑态 hydration 会拒采信不满足
+        # 该不变式的条目，数据集本身就得是自洽的交付件
         {"step": 1, "action": "left_click_drag",
          "start_vertices": [10, 20, 40, 60], "start_center": [25, 40],
-         "end_vertices": [100, 120, 150, 180], "end_center": [110, 130]},
+         "end_vertices": [100, 120, 120, 140], "end_center": [110, 130]},
     ]
     coords1 = [
         {"step": 0, "action": "left_click",
@@ -138,8 +141,10 @@ def test_load_completed_round0(editor):
 
     assert editor.steps[1]["screenshot_filename"] == f"gui_{editor.gui_number}_0002.png"
     assert editor.steps[1]["data"]["step"] == 1
-    assert editor.steps[1]["rect_info"] == ((10, 20, 30, 40), (100, 120, 50, 60))
+    assert editor.steps[1]["rect_info"] == ((10, 20, 30, 40), (100, 120, 20, 20))
     assert editor.steps[1]["selection_type"] == "drag"
+    # hydration 未检出任何 bbox/coordinate 不一致（数据集是自洽交付件）
+    assert editor._coord_issues == []
 
     # 表单回填与 JSON 一致
     assert editor.steps[0]["editor"].intent_input.text() == "第一轮点击"
@@ -191,7 +196,8 @@ def test_save_edited_round0_only_replaces_round0(editor):
         assert saved[key] == original[key]
 
     saved_coords = H.read_final_coords(editor)
-    assert saved_coords[-1] == coords[-1]
+    # 4.2（B4/B18）写盘副本按所属轮次注入 round，其余字段逐字段不变
+    assert saved_coords[-1] == {**coords[-1], "round": 1}
 
 
 # ---------------------------------------------------------------------------

@@ -101,6 +101,10 @@ def qapp():
 @pytest.fixture
 def dm(tmp_path):
     """function 级 DataManager，current_dir 指向独立临时目录。"""
+    return _make_data_manager(tmp_path)
+
+
+def _make_data_manager(tmp_path):
     manager = DataManager(base_dir=str(tmp_path))
     manager.create_task_directory("mac", "test", "测试App")
     return manager
@@ -128,49 +132,69 @@ def auto_dialogs(dialogs):
 
 
 @pytest.fixture
-def editor(qapp, dm, dialogs, monkeypatch):
-    """function 级真实 AnnotationEditor。
+def editor_factory(qapp, dialogs, monkeypatch, tmp_path):
+    """AnnotationEditor 工厂（对齐 root/安卓端 editor_factory 的 make(auto_init=...) 形态）。
 
-    - 使用临时 DataManager；
-    - 构造后调用 get_next_gui_number 并 create_gui_directory 初始化目录；
-    - 用 FakeScreenshotCaptureWindow 替换 annotation_editor 模块级 ScreenshotCaptureWindow；
-    - yield 后关闭并 deleteLater。
+    续采类用例需要在同一测试内构造第二个编辑器读取同一份草稿，故：
+      - make() 缺省时每次新建一个指向同一 tmp_path 的 DataManager；
+      - make(dm=...) 复用既有 DataManager（editor fixture 用它保持与 dm 的关联）；
+      - make(auto_init=False) 不预分配 gui_number / 不建任务目录。
+    teardown 统一 cleanup_resources + close + deleteLater，并在 close 之间推进事件
+    循环，避免已析构对象被在途 singleShot 命中。
     """
-    # 模块级替换：annotation_editor.py 内 `from screenshot_capture import ScreenshotCaptureWindow`
-    # 之后所有对 ScreenshotCaptureWindow 的引用都指向 Fake
-    fake_cls = FakeScreenshotCaptureWindow
-    monkeypatch.setattr(_ae, "ScreenshotCaptureWindow", fake_cls)
+    # 模块级替换：annotation_editor.py 内 `from screenshot_capture import
+    # ScreenshotCaptureWindow` 之后所有引用都指向 Fake
+    monkeypatch.setattr(_ae, "ScreenshotCaptureWindow", FakeScreenshotCaptureWindow)
 
-    ed = AnnotationEditor(
-        data_manager=dm,
-        app_name="测试App",
-        task_instruction="测试指令：在测试App中完成一件事",
-        screen_info={"platform": "mac", "system": "macOS", "screen_size": [1920, 1080]},
-        app_type="测试",
-        hotkey_listener=None,
-        init_window=None,
-    )
-    # 产品代码里 gui_number 为 None 时延迟在首次截图分配；这里我们提前分一个，
-    # 方便草稿/轮次等测试在截图前也能产生正确路径。
-    ed.gui_number = dm.get_next_gui_number()
-    dm.create_gui_directory(ed.gui_number)
+    editors = []
 
-    ed._test_dialogs = dialogs
+    def make(dm=None, app_name="测试App",
+             task_instruction="测试指令：在测试App中完成一件事",
+             app_type="测试", screen_info=None, auto_init=True):
+        manager = dm if dm is not None else _make_data_manager(tmp_path)
+        ed = AnnotationEditor(
+            data_manager=manager,
+            app_name=app_name,
+            task_instruction=task_instruction,
+            screen_info=screen_info or {
+                "platform": "mac", "system": "macOS",
+                "screen_size": [1920, 1080],
+            },
+            app_type=app_type,
+            hotkey_listener=None,
+            init_window=None,
+        )
+        # 产品代码里 gui_number 为 None 时延迟在首次截图分配；这里默认提前分一个，
+        # 方便草稿/轮次等测试在截图前也能产生正确路径。
+        if auto_init:
+            ed.gui_number = manager.get_next_gui_number()
+            manager.create_gui_directory(ed.gui_number)
 
-    qapp.processEvents()
-    yield ed
-
-    ed.cleanup_resources()
-    try:
-        if not ed._is_closing:
-            ed.close()
-    except RuntimeError:
-        pass
-    try:
-        ed.deleteLater()
-    except Exception:
-        pass
-    try:
+        ed._test_dialogs = dialogs
+        editors.append(ed)
         qapp.processEvents()
-    except Exception:
-        pass
+        return ed
+
+    yield make
+
+    for ed in editors:
+        ed.cleanup_resources()
+        try:
+            if not ed._is_closing:
+                ed.close()
+        except RuntimeError:
+            pass
+        try:
+            ed.deleteLater()
+        except Exception:
+            pass
+        try:
+            qapp.processEvents()
+        except Exception:
+            pass
+
+
+@pytest.fixture
+def editor(editor_factory, dm):
+    """function 级真实 AnnotationEditor（基于 editor_factory，与 dm 同源）。"""
+    return editor_factory(dm=dm)
