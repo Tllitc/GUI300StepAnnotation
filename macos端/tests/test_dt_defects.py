@@ -268,7 +268,7 @@ class TestDT7:
         """DT-7 回归：原为单框 click → 双框 drag 重新截图 → selection_type 归一化为 drag。"""
         H.append_step(editor)
         idx = len(editor.steps) - 1
-        H.fill_step(editor, idx, action_chinese="左键单击", intent="测试", coord_text="250,350")
+        H.fill_step(editor, idx, action_chinese="左键单击", intent="测试", coord_text="250,400")
         old_selection = editor.steps[idx]["selection_type"]
         # 默认 Fake 发的是单框，selection_type="click"
         assert old_selection == "click", f"初始 selection_type 应为 click，实际 {old_selection}"
@@ -390,7 +390,7 @@ class TestMultiRound:
         H.append_step(editor)
         idx = len(editor.steps) - 1
         H.fill_step(editor, idx, action_chinese="左键单击",
-                    intent="第二轮第 1 步", coord_text="400,500")
+                    intent="第二轮第 1 步", coord_text="250,400")
         H.confirm(editor)   # confirm_button_clicked 普通确认
         editor.save_current_round()
 

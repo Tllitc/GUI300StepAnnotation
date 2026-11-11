@@ -41,10 +41,16 @@ def _trajectory(final_json):
     return final_json["messages"][1]["trajectory"]
 
 
+def _trajectories(final_json):
+    """按轮顺序取各 assistant 消息的 trajectory 列表（INV-14 需覆盖多轮）。"""
+    return [m["trajectory"] for m in final_json["messages"]
+            if m["role"] == "assistant"]
+
+
 def _fill_and_confirm(editor, index, intent):
     """把（通常是插入产生的）未确认步填全并确认，满足 terminate 全量校验。"""
     H.fill_step(editor, index, action_chinese="左键单击", intent=intent,
-                coord_text="250,350")
+                coord_text="250,400")
     H.confirm(editor)
 
 
@@ -65,6 +71,9 @@ class TestInsertIntegrity:
         mem_names = [s["screenshot_filename"] for s in editor.steps]
         I.assert_model(editor)
         I.assert_files(editor)
+        # INV-11：中间插入天然破坏序号单调（新图取磁盘 max+1 却插到中间），
+        # 只守住「全局唯一 + 命名合规 + 引用存在」。
+        I.assert_screenshot_order(editor, strict_monotonic=False)
 
         json_path = H.finish(editor, action="terminate")
         assert json_path, "最终 JSON 产出失败"
@@ -88,6 +97,8 @@ class TestInsertIntegrity:
 
         coords = H.read_final_coords(editor)
         I.assert_coords_aligned(editor, final, coords)
+        # INV-14：每条 coords 框中心须等于同步的交付 coordinate（冒领不复现）
+        I.assert_coords_center_match(coords, _trajectories(final))
         I.assert_final_json(editor, expected_rounds=1)
 
     def test_insert_after_last_boundary(self, editor):
@@ -108,6 +119,8 @@ class TestInsertIntegrity:
         I.assert_files(editor)
         I.assert_sidebar(editor)
         I.assert_naming(editor)
+        # INV-11：末尾插入保持序号单调、无空洞，可走严格口径
+        I.assert_screenshot_order(editor)
 
     def test_insert_then_delete_inserted(self, editor):
         """插入后再删除该插入步：回到 3 步、插入文件删净、原文件完好。"""
@@ -205,6 +218,8 @@ class TestDeleteIntegrity:
         H.delete_current(editor, confirm=True)
         assert len(editor.steps) == 4
         assert deleted_file not in set(os.listdir(_gui_dir(editor)))
+        # INV-11：中间删除留空洞属预期，allow_holes 默认放开；序号仍单调
+        I.assert_screenshot_order(editor)
 
         # finish 前捕获内存态（terminate 分支会清空 steps）
         mem_names = [s["screenshot_filename"] for s in editor.steps]
@@ -225,6 +240,8 @@ class TestDeleteIntegrity:
 
         coords = H.read_final_coords(editor)
         I.assert_coords_aligned(editor, final, coords)
+        # INV-14：删除后 coords 与轨迹重编号，框中心仍须逐步对齐
+        I.assert_coords_center_match(coords, _trajectories(final))
         I.assert_final_json(editor, expected_rounds=1)
 
     def test_delete_then_insert(self, editor):
@@ -391,6 +408,8 @@ class TestCombinedSequence:
         I.assert_files(editor)
         I.assert_sidebar(editor)
         I.assert_naming(editor)
+        # INV-11：交错含中间插入，破坏单调，仅守唯一 + 合规 + 引用存在
+        I.assert_screenshot_order(editor, strict_monotonic=False)
 
         # 结束后校验
         json_path = H.finish(editor, action="terminate")
@@ -409,6 +428,8 @@ class TestCombinedSequence:
 
         coords = H.read_final_coords(editor)
         I.assert_coords_aligned(editor, final, coords)
+        # INV-14：交错操作后中心-坐标一致性仍须逐步成立
+        I.assert_coords_center_match(coords, _trajectories(final))
         I.assert_final_json(editor, expected_rounds=1)
 
     def test_ops_then_crash_resume(self, editor):
@@ -449,8 +470,10 @@ class TestMultiRoundIntegrity:
         # 第 1 轮：2 步
         H.walk_steps(editor, 2, intent_template="R1第{i}步")
         editor.save_current_round()
-        editor.steps = []
-        editor.current_step_index = -1
+        # 走正规切轮入口 reset_for_new_task（生产环境 start_new_round/create_new_task
+        # 均经此路径），同步销毁上一轮的 stack 步骤页；若只手动 steps=[] 会留下孤儿页，
+        # 令 stack 位置与 steps 下标错位，后续删除的 _drop_stack_page 会误杀活跃编辑器。
+        editor.reset_for_new_task()
         assert len(editor.rounds) == 1
 
         # 第 2 轮：3 步 → 插入 → 删除
@@ -462,8 +485,7 @@ class TestMultiRoundIntegrity:
         assert len(editor.steps) == 3
 
         editor.save_current_round()
-        editor.steps = []
-        editor.current_step_index = -1
+        editor.reset_for_new_task()
         assert len(editor.rounds) == 2
 
         # 直接结束（steps 已空）
@@ -487,3 +509,7 @@ class TestMultiRoundIntegrity:
         # 第 2 轮轨迹顺序：[R2第1步, R2插入, R2第3步]
         r2_intents = [e.get("intent") for e in trajectories[1]]
         assert r2_intents == ["R2第1步", "R2插入", "R2第3步"], r2_intents
+
+        # INV-14：多轮按 round 字段精确索引，各轮中心-坐标逐条对齐
+        coords = H.read_final_coords(editor)
+        I.assert_coords_center_match(coords, trajectories, where="多轮 coords")

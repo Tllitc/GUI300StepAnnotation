@@ -27,6 +27,106 @@ from PyQt5.QtGui import (QPixmap, QImage, QFont, QPainter, QPen, QColor,
 from screenshot_capture import ScreenshotCaptureWindow
 from data_manager import DataManager
 
+# 需要拉框坐标的动作全集。校验层（validate_step_at：要求用户必须标注）与
+# 采集层（_collect_coords_entries：决定哪些步骤写入 coords）共用同一常量，
+# 杜绝两处口径漂移（B6：scroll 被校验层要求拉框却不被采集层收集，用户按要求
+# 标的顶点在交付数据中静默丢失）
+COORD_ACTION_TYPES = {"left_click", "double_click", "triple_click",
+                      "right_click", "middle_click", "mouse_move",
+                      "left_click_drag", "type", "scroll"}
+
+# center ↔ coordinate 的判定口径：产品写回守卫与测试不变量 INV-14 共用同一份
+# 纯标准库实现。Windows/根目录版本从 tools.coords_center_repair 导入这几个函数；
+# macos端 不落地该离线修复脚本（用户确认：仅用于修复历史问题数据，与产品代码
+# 解耦、不参与打包），故在此内联同一份纯标准库实现，保证三处判定口径不漂移。
+# 容差常量改动只应在 COORD_CENTER_TOL 这一处：产品侧 center = x + w // 2，
+# 奇数宽高会向下取整，故 1px 内视为一致。
+COORD_CENTER_TOL = 1
+
+DRAG_ACTION = "left_click_drag"
+
+
+def coord_pair(value):
+    """[x, y] → (int, int)；不可解析（缺失/非数组/含非数值）返回 None。"""
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    pair = []
+    for item in value[:2]:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        if item != item:  # NaN
+            return None
+        pair.append(int(item))
+    return (pair[0], pair[1])
+
+
+def is_zero_pair(pair):
+    """(0, 0) 在交付数据里等价于「没有可用坐标」，不作为比对基准。"""
+    return pair is not None and pair[0] == 0 and pair[1] == 0
+
+
+def center_of(vertices):
+    """vertices [x1, y1, x2, y2] → 产品口径的框中心 (x1 + w//2, y1 + h//2)。
+
+    中心值一律由 vertices 重算而非直接读条目自带的 center —— center 本身
+    也可能被污染，vertices 才是拉框现场的真实记录。
+    """
+    if not isinstance(vertices, (list, tuple)) or len(vertices) < 4:
+        return None
+    x1, y1, x2, y2 = (int(vertices[0]), int(vertices[1]),
+                      int(vertices[2]), int(vertices[3]))
+    return (x1 + (x2 - x1) // 2, y1 + (y2 - y1) // 2)
+
+
+def entry_coordinate_mismatch(entry, coordinate=None, start_coordinate=None,
+                              tol=COORD_CENTER_TOL):
+    """单条 coords 条目与其所属步骤的坐标值比对。
+
+    :return: (result, detail)
+        result=True  不一致（或 center/vertices 不可解析），需要人工处置
+        result=False 一致
+        result=None  交付侧没有可用坐标值，无从比对（跳过，不算缺陷）
+        detail 为可直接展示给人看的差异说明
+    """
+    if not isinstance(entry, dict):
+        return True, "条目不是 JSON 对象"
+    action = entry.get("action")
+    if action not in COORD_ACTION_TYPES:
+        return None, f"动作 {action!r} 无需坐标"
+
+    if action == DRAG_ACTION:
+        # (说明, vertices 值, center 值, 该框应对齐的 JSON 坐标)
+        axes = (("start_center", entry.get("start_vertices"), start_coordinate,
+                 entry.get("start_center")),
+                ("end_center", entry.get("end_vertices"), coordinate,
+                 entry.get("end_center")))
+    else:
+        axes = (("center", entry.get("vertices"), coordinate, entry.get("center")),)
+
+    reasons = []
+    checked = 0
+    for label, vertices_value, coord_value, center_value in axes:
+        # 以 vertices 重算为准；vertices 缺失时退回条目自带的 center
+        center = center_of(vertices_value) if isinstance(vertices_value, (list, tuple)) \
+            else coord_pair(center_value)
+        if center is None:
+            reasons.append(f"盘上 {label} 无法解析")
+            continue
+        target = coord_pair(coord_value)
+        if target is None or is_zero_pair(target):
+            continue
+        checked += 1
+        dx = abs(center[0] - target[0])
+        dy = abs(center[1] - target[1])
+        if dx > tol or dy > tol:
+            reasons.append(f"盘上 {label}={list(center)} / JSON coordinate={list(target)}"
+                           f"（偏差 {dx},{dy}px）")
+    if reasons:
+        return True, "；".join(reasons)
+    if not checked:
+        return None, f"{action} 在交付 JSON 中无可用坐标值，跳过比对"
+    return False, ""
+
 
 class StepEditorWidget(QWidget):
     """单个步骤的编辑界面"""
@@ -696,8 +796,10 @@ class StepEditorWidget(QWidget):
         # 构建动作对象
         action = {"action": action_type}
 
-        # 添加坐标（open_app、open_url、terminate、answer、wait、key 不需要坐标）
-        if action_type not in ["open_app", "open_url", "terminate", "answer", "wait", "key"]:
+        # 添加坐标（无坐标语义的动作不写 coordinate 键；B12：豁免名单曾缺
+        # answer_terminate，使该动作交付数据里多出无意义的 coordinate:[0,0]）
+        if action_type not in ["open_app", "open_url", "terminate",
+                               "answer", "answer_terminate", "wait", "key"]:
             try:
                 x = int(self.coord_x_input.text()) if self.coord_x_input.text() else 0
                 y = int(self.coord_y_input.text()) if self.coord_y_input.text() else 0
@@ -1304,11 +1406,20 @@ class AnnotationEditor(QMainWindow):
         self._is_closing = False
         # 防止截图流程重入：隐藏窗口到截图遮罩弹出期间忽略重复的 Ctrl+Q
         self._capture_in_flight = False
+        # 原图重新拉框弹窗与其目标步骤下标（编辑已完成任务时使用）
+        self.relabel_window = None
+        self._relabel_step_index = None
+        # B2 轮次切换门闩：轮切换延后弹新轮对话框期间置 True，
+        # 此间所有采集/编辑入口（含 relabel/截图）一律早退，避免用同一条指令凑出重复轮次
+        self._round_transition_pending = False
         # DT-8 相关：stack 页序不变式曾被打穿时置 True，供 undo/delete 等危险操作拦截
         self._stack_invariant_broken = False
         # 最终数据已成功落盘标志：finish_all_annotation 成功后置 True，
         # 使随后的 closeEvent 不再对同一批数据二次保存
         self._final_data_saved = False
+        # 5.3（B7）临时抑制草稿落盘：创建新任务时 gui_number 尚未换新，
+        # 此间任何草稿写入都会落到上一个已交付任务的目录里
+        self._suppress_draft_write = False
 
         # 「已完成任务再编辑」模式状态
         self._edit_mode = False
@@ -1316,6 +1427,7 @@ class AnnotationEditor(QMainWindow):
         self._edit_round_index = 0     # 正在编辑的轮次下标
         self._coords_rounds = []       # 每轮一份 coords 列表（与 self.rounds 等长）
         self._original_coords_exist = False
+        self._coord_issues = []        # hydration 检出的 bbox↔coordinate 不一致项
 
         # draft 增量自动保存（防抖定时器）
         self.draft_timer = QTimer(self)
@@ -1406,6 +1518,13 @@ class AnnotationEditor(QMainWindow):
         recapture_btn.clicked.connect(self.recapture_current_step)
         toolbar.addWidget(recapture_btn)
 
+        # 编辑已完成任务时可见：不重新截图，直接在磁盘原图上重新拖框
+        self.relabel_btn = QPushButton("在原图上重新拉框")
+        self.relabel_btn.setStyleSheet("QPushButton { background-color: #9C27B0; color: white; }")
+        self.relabel_btn.clicked.connect(self.relabel_current_step)
+        self.relabel_btn.hide()
+        toolbar.addWidget(self.relabel_btn)
+
         # macOS 版全局热键由 pynput 子进程监听物理 Control+Q（见 main.py）
         screenshot_hk = "Control"
         capture_btn = QPushButton(f"给下一步截图 ({screenshot_hk}+Q)")
@@ -1492,9 +1611,7 @@ class AnnotationEditor(QMainWindow):
                 missing.append("动作描述不能为空")
 
         # 2. 坐标类动作（全屏截图豁免）
-        coord_actions = ("left_click", "double_click", "triple_click",
-                         "right_click", "middle_click", "mouse_move",
-                         "left_click_drag", "type", "scroll")
+        coord_actions = COORD_ACTION_TYPES
         fullscreen = step.get("selection_type") == "fullscreen"
         if action_type in coord_actions and not fullscreen:
 
@@ -1659,7 +1776,7 @@ class AnnotationEditor(QMainWindow):
         except (AttributeError, RuntimeError):
             pass
 
-        for attr in ("capture_window", "reference_capture_window"):
+        for attr in ("capture_window", "reference_capture_window", "relabel_window"):
             win = getattr(self, attr, None)
             if win is not None:
                 try:
@@ -1670,6 +1787,9 @@ class AnnotationEditor(QMainWindow):
 
     def recapture_current_step(self):
         """重新截取当前步骤的截图，如果没有步骤则开始第一个截图"""
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
         if self._is_closing or self._capture_in_flight:
             return
         if self.current_step_index < 0 or self.current_step_index >= len(self.steps):
@@ -1697,6 +1817,77 @@ class AnnotationEditor(QMainWindow):
         self.capture_window = ScreenshotCaptureWindow()
         self.capture_window.capture_completed.connect(self.on_recapture_completed)
         self.capture_window.show()
+
+    def relabel_current_step(self):
+        """编辑已完成任务：在该步磁盘原截图上重新拖框（不重新截图、不覆盖 PNG）"""
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
+        if self._is_closing or self._capture_in_flight:
+            return
+        if not self._edit_mode:
+            return
+        if not (0 <= self.current_step_index < len(self.steps)):
+            self.status_label.setText("没有可重新拉框的步骤")
+            return
+        filename = self.steps[self.current_step_index]["screenshot_filename"]
+        if not filename:
+            self.status_label.setText("该步骤没有截图文件，请使用[重新截图]")
+            return
+        background = self.data_manager.load_screenshot(self.gui_number, filename)
+        if background is None or background.isNull():
+            self.status_label.setText(f"截图文件缺失（{filename}），请使用[重新截图]")
+            return
+        # 与所有采集入口共用同一门闩（不新增并行标志）；背景模式不隐藏主窗口、不延时
+        self._capture_in_flight = True
+        self._relabel_step_index = self.current_step_index
+        self.relabel_window = ScreenshotCaptureWindow(background_pixmap=background)
+        self.relabel_window.capture_completed.connect(self.on_relabel_completed)
+        self.relabel_window.show()
+
+    def on_relabel_completed(self, original_pixmap, marked_pixmap, rect_info, selection_type):
+        """原图重新拉框完成回调：只改内存中的标注与坐标，不写任何图片文件"""
+        # 第一行无条件复位门闩，任何路径都不泄漏
+        self._capture_in_flight = False
+        if self._is_closing:
+            return
+        index = self._relabel_step_index
+        self._relabel_step_index = None
+        self.relabel_window = None  # closeEvent 仍会兜底清理同名属性
+        if selection_type == "cancelled" or not rect_info:
+            self.status_label.setText("重新拉框已取消，标注框保持不变")
+            return
+        if not (0 <= index < len(self.steps)):
+            return
+        if index != self.current_step_index:
+            # 弹窗期间不预期切步，仍防御式对齐
+            self.display_step(index)
+        current_step = self.steps[index]
+        editor = current_step["editor"]
+        filename = current_step["screenshot_filename"]
+        # 复用与重新截图同一口径的初始化（双框自动切「拖拽」并归一化 selection_type）
+        normalized_type = self._init_editor_from_capture(
+            editor, marked_pixmap, rect_info, selection_type
+        )
+        current_step["rect_info"] = rect_info
+        current_step["selection_type"] = normalized_type
+        editor.set_preview_meta(filename, rect_info, normalized_type)
+        # 让写回走实时 editor.get_data() 而不是旧快照
+        current_step.pop("data", None)
+        # marked_pixmap 是缩放显示图，改从磁盘原图重绘，避免预览停留在低分辨率
+        self._on_editor_preview_resize(editor)
+        self.update_undo_button_visibility()
+        # 框已变化：按文件名清除该截图的全部缩略图缓存 key（与 DEFECT-B 同口径，
+        # 旧 invalidate_thumb 用更新后的 rect/type 算新 key，清不掉旧死缓存），
+        # 再重载条目（动作类型可能随拖拽框变化）
+        self.sidebar.remove_thumb_cache_by_filename(filename)
+        item = self.sidebar.item_widgets[index] \
+            if index < len(self.sidebar.item_widgets) else None
+        if item is not None:
+            item.thumb_loaded = False
+            self.sidebar.request_thumb(index, high_priority=True)
+            self.refresh_step_item(index)
+        self.status_label.setText(f"已在原图上重新拉框 {filename}（请点击[保存修改]写回）")
 
     def on_recapture_completed(self, original_pixmap, marked_pixmap, rect_info, selection_type):
         """重新截图完成回调"""
@@ -1769,6 +1960,9 @@ class AnnotationEditor(QMainWindow):
 
     def start_capture(self):
         """开始截图捕获（追加模式：新步骤加到末尾）"""
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
         if self._is_closing or self._capture_in_flight:
             return
         self._capture_insert_after = None
@@ -1776,6 +1970,9 @@ class AnnotationEditor(QMainWindow):
 
     def start_insert_capture(self):
         """在当前步骤之后插入一步截图（插入模式）"""
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
         if self._is_closing or self._capture_in_flight:
             return
         if not (0 <= self.current_step_index < len(self.steps)):
@@ -1992,6 +2189,35 @@ class AnnotationEditor(QMainWindow):
             self._stack_invariant_broken = True
             print(f"[INV] stack 页序不变式校验失败: {e}（已置 _stack_invariant_broken=True）")
 
+    def _drop_stack_page(self, index):
+        """摘除并真正销毁 stack 第 index 页（B15：removeWidget 只脱离布局，不销毁对象）
+
+        removeWidget 之后 widget 仍是 QStackedWidget 的子对象；再 setParent(None) 会让它
+        变成不可见的游离顶层窗口 —— 对象连同其中的截图 pixmap 一直留在内存里，
+        删步/撤销/重置做得越多泄漏越严重。步骤页已从 self.steps 弹出（不再有任何引用）时，
+        必须 deleteLater 把它交给事件循环销毁。
+
+        注意：_rebuild_stack_page_order 的摘页属于“摘后立刻按新序挂回”，widget 仍由
+        self.steps 持有，绝不能走这里。
+        """
+        widget = self.stack_widget.widget(index)
+        if widget is None:
+            return
+        self.stack_widget.removeWidget(widget)
+        widget.setParent(None)
+        widget.deleteLater()
+
+    def _drop_all_step_pages(self):
+        """销毁除第 0 页空提示页以外的全部步骤页（整体清空现场时用）
+
+        现场整体重建时，上一现场检出的 coords 不一致清单也随之失效：不跟着清空
+        的话，草稿恢复/切轮后残留的旧记录会被写回守卫当作“本轮未触碰的
+        继承性缺陷”而放过，审计范围出现空洞。
+        """
+        self._coord_issues = []
+        while self.stack_widget.count() > 1:
+            self._drop_stack_page(1)
+
     def _renumber_steps_from(self, start_index):
         """从 start_index 起按新下标连续重编号：编辑器显示编号 + 已有 data 快照的 step 字段
 
@@ -2030,6 +2256,9 @@ class AnnotationEditor(QMainWindow):
 
     def delete_current_step(self):
         """删除当前步骤：二次确认后删除步骤/页面/磁盘截图，后续步骤自动前移重编号"""
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
         index = self.current_step_index
         if not (0 <= index < len(self.steps)):
             # 无步骤（含 answer/terminate 后 steps 已清空）直接保护返回
@@ -2047,11 +2276,8 @@ class AnnotationEditor(QMainWindow):
         removed = self.steps.pop(index)
         removed_filename = removed.get("screenshot_filename", "")
 
-        # 删除 stack 对应页并释放（setParent(None) 解除父子关系）
-        page = self.stack_widget.widget(index + 1)  # +1 因为第 0 页是空提示页
-        if page is not None:
-            self.stack_widget.removeWidget(page)
-            page.setParent(None)
+        # 删除 stack 对应页并真正销毁（B15：+1 因为第 0 页是空提示页）
+        self._drop_stack_page(index + 1)
 
         # 删除磁盘截图文件（失败仅打印不阻断）
         self._delete_screenshot_file(removed_filename)
@@ -2256,6 +2482,10 @@ class AnnotationEditor(QMainWindow):
         "steps.pop() 删末尾步但 current_step_index 仍指向中间步" 的模型错位。
         同时 DT-8 修复：stack 不变式已破时也拒绝操作，防止删错编辑器。
         """
+        # B2：切轮窗口内不得删改本轮已落轮的数据
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
         if len(self.steps) == 0:
             return
         # DT-9: 非末步拦截
@@ -2285,10 +2515,8 @@ class AnnotationEditor(QMainWindow):
             # 移除最后一个步骤
             removed = self.steps.pop()
 
-            # 从 stack widget 移除（撤销的永远是最后一页，setParent(None) 释放）
-            widget = self.stack_widget.widget(self.stack_widget.count() - 1)
-            self.stack_widget.removeWidget(widget)
-            widget.setParent(None)
+            # 从 stack widget 移除并销毁（撤销的永远是最后一页，B15）
+            self._drop_stack_page(self.stack_widget.count() - 1)
 
             # 删除截图文件（失败仅打印不阻断），并清理其缩略图缓存
             removed_filename = removed.get("screenshot_filename", "")
@@ -2316,6 +2544,10 @@ class AnnotationEditor(QMainWindow):
         self.showMinimized()
 
     def confirm_button_clicked(self):
+        # B2：切轮窗口内的确认会被旧指令再次落轮，直接拒绝
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
         if self.current_step_index >= 0 and self.current_step_index < len(self.steps):
             editor = self.steps[self.current_step_index]["editor"]
             action_type_chinese = editor.action_type_combo.currentText()
@@ -2341,6 +2573,10 @@ class AnnotationEditor(QMainWindow):
 
     def save_current_step(self):
         """保存当前步骤"""
+        # B2：answer/terminate 落轮后的 300ms 切轮窗口内拒绝再次落轮
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
         if self.current_step_index < 0 or self.current_step_index >= len(self.steps):
             QMessageBox.warning(self, "警告", "没有可保存的步骤！")
             return
@@ -2386,6 +2622,8 @@ class AnnotationEditor(QMainWindow):
             self.save_current_round()
             # 清空步骤列表，避免后续重复保存
             self.steps = []
+            # 升起门闩，300ms 切轮窗口内禁止采集/编辑（B2）
+            self._round_transition_pending = True
             QTimer.singleShot(300, lambda: self.start_new_round(from_answer=True))
         elif selected_action_type in ("terminate", "answer_terminate"):
             # 结束前全量必填项校验（含当前步）：存在缺失则弹窗并阻止结束，
@@ -2413,6 +2651,9 @@ class AnnotationEditor(QMainWindow):
             # 清空步骤列表，避免 finish_all_annotation 重复保存
             self.steps = []
 
+            # 升起门闩：这条分支同样延后 300ms 弹后续对话框，窗口内被再次确认/截图
+            # 会用同一条旧指令再落一轮，并让 show_new_task_dialog 弹出两次（B2）
+            self._round_transition_pending = True
             # 显示后续对话框
             QTimer.singleShot(300, self.show_new_task_dialog)
         else:
@@ -2451,12 +2692,24 @@ class AnnotationEditor(QMainWindow):
     def _collect_coords_entries(self):
         """按当前 self.steps 现场重建本轮 coords 条目列表（step 为轮内 0 起连续下标）"""
         entries = []
-        coord_action_types = {"left_click", "double_click", "triple_click",
-                              "right_click", "middle_click", "mouse_move",
-                              "left_click_drag", "type"}
+        # B6：改用 COORD_ACTION_TYPES。旧写法缺 scroll，导致校验层要求拉框的
+        # scroll 步顶点在落盘时被丢弃
+        coord_action_types = COORD_ACTION_TYPES
 
         for i, step in enumerate(self.steps):
             rect_info = step.get("rect_info")
+            # 编辑态 hydration 判定盘上 bbox 与 coordinate 不一致/缺失（absent/mismatch）：
+            # 既不采信也不丢弃，按当前步序重编号后原样保留，避免「打开看一眼就丢数据」。
+            # 动作已被改成非坐标类型时不走此分支，条目应被丢弃（语义正确）
+            orig = step.get("orig_coord_entry")
+            if not rect_info and isinstance(orig, dict):
+                editor = step["editor"]
+                orig_action = editor.action_type_mapping.get(
+                    editor.action_type_combo.currentText(),
+                    editor.action_type_combo.currentText())
+                if orig_action in coord_action_types:
+                    entries.append({**copy.deepcopy(orig), "step": i})
+                continue
             if not rect_info:
                 continue
 
@@ -2557,6 +2810,9 @@ class AnnotationEditor(QMainWindow):
         """构造 draft 并写盘（失败仅打印日志，不打断主流程）"""
         # 编辑已完成任务模式下不写草稿（关窗写回最终 JSON 由 closeEvent 处理）
         if self._edit_mode:
+            return
+        if self._suppress_draft_write:
+            # 5.3（B7）新任务切换窗口：旧 gui_number 已交付，不得再往它的目录写草稿
             return
         if self.gui_number is None:
             return
@@ -2819,9 +3075,15 @@ class AnnotationEditor(QMainWindow):
 
     @classmethod
     def _rect_info_from_coord_entry(cls, entry):
-        """coords 条目 → (rect_info, selection_type)；无坐标步视为全屏"""
+        """coords 条目 → (rect_info, selection_type)
+
+        「没有框」和「全屏截图」是两回事：条目缺失或没有顶点时返回空 rect 与
+        None，由 _classify_coord_state 结合 JSON 坐标值判定究竟是真全屏还是框
+        丢失。旧写法在这里凭空返回 "fullscreen"，会让 validate_step_at 的全屏
+        豁免把「coords 少条目」变成静默通过校验的缺陷——正是本次要修的失败模式。
+        """
         if not isinstance(entry, dict):
-            return (), "fullscreen"
+            return (), None
         start = entry.get("start_vertices")
         end = entry.get("end_vertices")
         if start and end and len(start) >= 4 and len(end) >= 4:
@@ -2829,19 +3091,119 @@ class AnnotationEditor(QMainWindow):
         vertices = entry.get("vertices")
         if vertices and len(vertices) >= 4:
             return cls._vertices_to_rect(vertices), None
-        return (), "fullscreen"
+        return (), None
 
     @staticmethod
-    def _find_coord_entry(coords, step, fallback_index):
-        """在该轮 coords 中按 step 查找条目；找不到则回退为顺序第 fallback_index 条"""
+    def _find_coord_entry(coords, step):
+        """在该轮 coords 中按 step 精确查找条目；未命中返回 None
+
+        曾有 fallback_index 参数：按 step 落空时回退取列表第 i 条。位置相同不代表
+        内容相关——旧交付件（B6 采集层缺 scroll，coords 少几条）会让下标整体漂移，
+        编辑态由此冒领别的步骤的顶点，写回时污染 bbox 以正确 step 编号落盘。
+        位置猜测不可挽救，彻底删除。
+        """
         if not coords:
             return None
         for entry in coords:
-            if isinstance(entry, dict) and entry.get("step") == step:
+            if not isinstance(entry, dict):
+                continue
+            step_value = entry.get("step")
+            # bool 是 int 子类，step 写成 true/false 属于脏数据，不参与匹配
+            if isinstance(step_value, int) and not isinstance(step_value, bool) \
+                    and step_value == step:
                 return entry
-        if 0 <= fallback_index < len(coords) and isinstance(coords[fallback_index], dict):
-            return coords[fallback_index]
         return None
+
+    @classmethod
+    def _find_coord_entry_by_center(cls, coords, action, coordinate,
+                                    start_coordinate, claimed_ids):
+        """按 center 恢复匹配：仅在 _find_coord_entry 落空后调用
+
+        兼容「step 编号整体漂移但框本身正确」的旧数据：在尚未被其它步骤认领的
+        条目里找 action 相同、且框中心与 JSON coordinate 逐轴差 ≤ COORD_CENTER_TOL
+        的那一条。命中的是对真实内容的验证，不是对列表位置的猜测。
+        """
+        if not coords or action not in COORD_ACTION_TYPES:
+            return None
+        for entry in coords:
+            if not isinstance(entry, dict) or id(entry) in claimed_ids:
+                continue
+            if entry.get("action") != action:
+                continue
+            mismatched, _detail = entry_coordinate_mismatch(
+                entry, coordinate, start_coordinate, COORD_CENTER_TOL)
+            # 只有「已验证一致」才认领；None（交付侧无可用坐标值）不足以证明归属
+            if mismatched is False:
+                claimed_ids.add(id(entry))
+                return entry
+        return None
+
+    @staticmethod
+    def _step_json_coordinates(step_data):
+        """trajectory 条目 → (action, coordinate, start_coordinate)
+
+        coordinate 统一由 coord_pair 归一为 (int, int) 或 None：缺失、非数组、
+        长度不足、含非数值均返回 None，避免各处再各自手写容错分支。
+        """
+        actions = (step_data or {}).get("actions")
+        if not isinstance(actions, list):
+            return None, None, None
+        for item in actions:
+            if not isinstance(item, dict):
+                continue
+            return (item.get("action"),
+                    coord_pair(item.get("coordinate")),
+                    coord_pair(item.get("start_coordinate")))
+        return None, None, None
+
+    @classmethod
+    def _classify_coord_state(cls, step_data, coord_entry):
+        """coords 条目 + JSON 坐标 → (rect_info, selection_type, coord_issue)
+
+        coord_issue ∈ {None, "absent", "mismatch", "no_box"}：
+          absent   交付 JSON 里该步有坐标值，coords 却没有可信的框 → 框丢失
+          mismatch 有条目但框中心与坐标值对不上（位置冒领的典型现场）→ 不采信
+          no_box   既没有框也没有坐标值 → 真全屏，沿用既有校验豁免
+        "absent"/"mismatch" 绝不返回 selection_type="fullscreen"，否则
+        validate_step_at 的坐标豁免会让「丢框」静默通过校验。
+        """
+        action, coordinate, start_coordinate = cls._step_json_coordinates(step_data)
+        rect_info, selection_type = cls._rect_info_from_coord_entry(coord_entry)
+
+        if action not in COORD_ACTION_TYPES:
+            # 非坐标类动作：有条目就按条目还原，没条目维持「全屏」现状
+            if coord_entry is None:
+                return (), "fullscreen", None
+            return rect_info, selection_type, None
+
+        has_coord = coordinate is not None and coordinate != (0, 0)
+        if not rect_info:
+            if has_coord:
+                return (), None, "absent"
+            return (), "fullscreen", "no_box"
+
+        if has_coord:
+            mismatched, _detail = entry_coordinate_mismatch(
+                coord_entry, coordinate, start_coordinate, COORD_CENTER_TOL)
+            if mismatched:
+                # 框中心与已交付坐标对不上：宁可不显示框，也不让错误 bbox 在
+                # 下次写回时以正确 step 编号落进已交付数据
+                return (), selection_type, "mismatch"
+        return rect_info, selection_type, None
+
+    @classmethod
+    def _coord_issue_detail(cls, step_data, coord_entry):
+        """给汇总告警用的一行差异说明（盘上值 vs JSON 值，给人直接看的格式）"""
+        _action, coordinate, _start_coordinate = cls._step_json_coordinates(step_data)
+        json_part = (f"JSON coordinate={list(coordinate)}" if coordinate
+                     else "JSON 无坐标值")
+        if coord_entry is None:
+            return f"coords 无对应条目 / {json_part}"
+        mismatched, detail = entry_coordinate_mismatch(
+            coord_entry, coordinate, _start_coordinate, COORD_CENTER_TOL)
+        if mismatched:
+            return detail
+        return f"coords 条目没有可用的框顶点 / {json_part}"
 
     def load_from_completed_json(self, completed_data, coords_entries, round_index, gui_dir):
         """从已完成任务的最终 JSON + coords 重建编辑现场（在 show 之前调用）
@@ -2900,6 +3262,10 @@ class AnnotationEditor(QMainWindow):
         current_trajectory = self.rounds[round_index].get("trajectory", [])
         current_coords = self._coords_rounds[round_index]
         missing_files = []
+        # 已被某个步骤认领的 coords 条目（用对象 id：条目内容可能重复，位置不能代表身份）
+        claimed_ids = set()
+        # hydration 现场逐条登记的不一致清单（循环前重置）
+        self._coord_issues = []
 
         for i, t_entry in enumerate(current_trajectory):
             step_data = copy.deepcopy(t_entry) if isinstance(t_entry, dict) else {}
@@ -2911,9 +3277,6 @@ class AnnotationEditor(QMainWindow):
             if filename and not os.path.exists(os.path.join(gui_dir, filename)):
                 missing_files.append(f"步骤 {i}: {filename}")
 
-            coord_entry = self._find_coord_entry(current_coords, step_data.get("step"), i)
-            rect_info, selection_type = self._rect_info_from_coord_entry(coord_entry)
-
             step_editor = StepEditorWidget(step_data=step_data)
             # 必填项实时校验 + 分栏 resize 后按磁盘原图重绘预览
             self._connect_editor_validation_signals(step_editor)
@@ -2922,6 +3285,23 @@ class AnnotationEditor(QMainWindow):
             )
             step_editor.set_step_number(i)
 
+            # 两趟匹配：先按 step 精确定位，落空才按 center 恢复（不再有位置回退）
+            step_action, coordinate, start_coordinate = self._step_json_coordinates(step_data)
+            coord_entry = self._find_coord_entry(current_coords, step_data.get("step"))
+            if coord_entry is not None:
+                claimed_ids.add(id(coord_entry))
+            else:
+                coord_entry = self._find_coord_entry_by_center(
+                    current_coords, step_action, coordinate, start_coordinate, claimed_ids)
+            rect_info, selection_type, coord_issue = self._classify_coord_state(
+                step_data, coord_entry)
+            if coord_issue in ("absent", "mismatch"):
+                action_cn = next((cn for cn, en in step_editor.action_type_mapping.items()
+                                  if en == step_action), step_action or "")
+                self._coord_issues.append((
+                    i, action_cn, coord_issue,
+                    self._coord_issue_detail(step_data, coord_entry)))
+
             self.steps.append({
                 "editor": step_editor,
                 "screenshot_filename": filename,
@@ -2929,8 +3309,29 @@ class AnnotationEditor(QMainWindow):
                 "selection_type": selection_type,
                 "data": step_data,
                 "confirmed": True,
+                # 盘上 bbox 与 coordinate 不一致时保留原条目快照，供写回时
+                # 原样继承（见 _collect_coords_entries），绝不让「打开看一眼」丢数据
+                "coord_issue": coord_issue,
+                "orig_coord_entry": (
+                    copy.deepcopy(coord_entry)
+                    if coord_issue in ("absent", "mismatch") and coord_entry else None),
             })
             self.stack_widget.addWidget(step_editor)
+
+        # 先于 display_step 告警：不一致必须先被看见，否则采集员会以为框没拉到
+        if self._coord_issues:
+            lines = []
+            for step_index, action_cn, issue_kind, detail in self._coord_issues:
+                kind_cn = "框丢失" if issue_kind == "absent" else "框与坐标值不一致"
+                lines.append(f"步骤 {step_index}（{action_cn}）· {kind_cn}：{detail}")
+            QMessageBox.warning(
+                self,
+                "coords 与坐标值不一致",
+                "检测到以下步骤的 bbox 与已交付坐标值对不上：\n\n"
+                + "\n".join(lines)
+                + "\n\n这些步骤的框未载入，保存不会改动盘上原条目；"
+                  "如需修复请在原图重新拉框。"
+            )
 
         if self.steps:
             self.display_step(0)
@@ -2951,7 +3352,16 @@ class AnnotationEditor(QMainWindow):
         self.status_label.setText(
             f"编辑已完成任务 gui_{self.gui_number} · 第 {round_index + 1} 轮"
         )
+        if self._coord_issues:
+            # 保留常规状态串，只追加告警：直接覆盖会让其他依赖该文本的
+            # 现场提示（和后续测试）被顶掉
+            self.status_label.setText(
+                self.status_label.text()
+                + f" · ⚠ 检测到 {len(self._coord_issues)} 个步骤的 bbox 与 coordinate 不一致"
+            )
         self.save_edit_btn.show()
+        # 编辑已完成任务：允许在磁盘原图上重新拉框
+        self.relabel_btn.show()
 
         self.revalidate_all_missing()
         self.refresh_sidebar(fully=True)
@@ -3063,6 +3473,48 @@ class AnnotationEditor(QMainWindow):
 
         return merged
 
+    def _audit_coord_consistency(self, trajectory, entries):
+        """写回前审计：本轮由内存 rect_info 新生成的条目必须 center ↔ coordinate 一致
+
+        只审计「本轮新写的」条目。编辑态从盘上原样继承的条目（hydration 已标为
+        absent/mismatch，见 _collect_coords_entries 的 orig_coord_entry 分支）不在
+        范围——那是本次编辑没有触碰的历史缺陷，工具既不伪造也不丢弃。
+        判定条件直接取自当前 steps 现场而不靠 hydration 记录的步序，因此中途
+        删步导致的下标漂移不会让审计漏掉真正被重写的条目。
+        :return: 不一致项描述列表（空表示通过）
+        """
+        inherited_steps = set()
+        for index, step in enumerate(self.steps):
+            if not step.get("rect_info") and isinstance(step.get("orig_coord_entry"), dict):
+                inherited_steps.add(index)
+
+        problems = []
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            action = entry.get("action")
+            if action not in COORD_ACTION_TYPES:
+                continue
+            step_index = entry.get("step")
+            if isinstance(step_index, bool) or not isinstance(step_index, int):
+                continue
+            if step_index in inherited_steps:
+                continue
+            if not (0 <= step_index < len(trajectory)):
+                problems.append(f"步骤 {step_index} [{action}]：coords 条目找不到对应的轨迹步骤")
+                continue
+            json_action, coordinate, start_coordinate = self._step_json_coordinates(
+                trajectory[step_index])
+            if json_action != action:
+                problems.append(
+                    f"步骤 {step_index}：coords 动作 {action} 与 JSON 动作 {json_action} 不一致")
+                continue
+            mismatched, detail = entry_coordinate_mismatch(
+                entry, coordinate, start_coordinate, COORD_CENTER_TOL)
+            if mismatched:
+                problems.append(f"步骤 {step_index} [{action}]：{detail}")
+        return problems
+
     def save_edited_round(self, silent=False):
         """校验并仅写回正在编辑的轮次（其余轮次与顶层字段原样保留）
 
@@ -3106,8 +3558,24 @@ class AnnotationEditor(QMainWindow):
             )
             trajectory.append(self._merge_step_with_original(step_data, original_step))
 
+        # 先验后改：审计不过就既不碰内存也不碰磁盘（与 B40 的 messages 校验同口径）。
+        # 旧写法先赋值 self.rounds / self._coords_rounds 再校验，一旦中途中止，
+        # 内存里已留下污染 bbox 且以正确 step 编号等着下一轮写回。
+        new_entries = self._collect_coords_entries()
+        audit_problems = self._audit_coord_consistency(trajectory, new_entries)
+        if audit_problems:
+            reason = ("coords 与坐标值不一致：\n"
+                      + "\n".join(f"  - {problem}" for problem in audit_problems))
+            if silent:
+                print(f"编辑写回中止（gui_{self.gui_number}）：{reason}")
+            else:
+                QMessageBox.critical(
+                    self, "错误", reason + "\n已拒绝写回，磁盘上的原文件未改变！"
+                )
+            return False
+
         self.rounds[round_index]["trajectory"] = trajectory
-        self._coords_rounds[round_index] = self._collect_coords_entries()
+        self._coords_rounds[round_index] = new_entries
 
         # 以原顶层字段为基底重建 messages，仅替换被编辑轮次
         data = copy.deepcopy(self._completed_json)
@@ -3122,6 +3590,10 @@ class AnnotationEditor(QMainWindow):
                 "trajectory": round_data.get("trajectory", []),
             })
 
+        # 1.4 安全网：编辑写回会整份替换已交付 JSON，先把原文件留一份 .bak（覆盖式）。
+        # 仅在原文件存在时生成；备份失败不阻断保存。
+        self.data_manager.backup_final_json(self.gui_number)
+
         filepath = self.data_manager.save_json_data(data, self.gui_number)
         if not filepath:
             if silent:
@@ -3130,14 +3602,34 @@ class AnnotationEditor(QMainWindow):
                 QMessageBox.critical(self, "错误", "保存修改失败，磁盘上的原文件未改变！")
             return False
 
-        # 扁平化各轮 coords 后写盘；原文件存在 coords 时即使为空也写，保持原契约
-        flat_coords = [entry for group in self._coords_rounds for entry in group]
-        if flat_coords or self._original_coords_exist:
+        # 1.5（B41）coords 只在真的收集到条目时才写盘。旧条件带了
+        # or self._original_coords_exist，会在「本轮导出 0 条坐标」时用空数组
+        # 覆盖已交付的坐标文件；现在改为告警并跳过写入，保留原文件。
+        # 4.2（B4/B18）按分组下标注入 round，与落轮路径同口径；用浅拷贝写出，
+        # 避免就地修改 _coords_rounds 里来自磁盘的历史条目对象。
+        flat_coords = []
+        for group_index, group in enumerate(self._coords_rounds):
+            for entry in group:
+                if isinstance(entry, dict):
+                    entry = {**entry, "round": group_index}
+                flat_coords.append(entry)
+        if flat_coords:
             try:
                 self.data_manager.save_coords_json(flat_coords, self.gui_number)
             except Exception as e:
                 print(f"保存修改时写出坐标失败: {e}")
+        elif self._original_coords_exist:
+            print(
+                f"警告：编辑写回收集到 0 条坐标，已跳过 coords 写入以保留原文件"
+                f"（gui_{self.gui_number}）"
+            )
         self.all_coords_entries = flat_coords
+        if self._coord_issues:
+            # 继承性盘上缺陷本次未消除：写回成功不等于数据已干净，提醒显式处置
+            print(
+                f"提示：gui_{self.gui_number} 仍有 {len(self._coord_issues)} 个步骤的盘上 bbox 与 "
+                f"coordinate 不一致（本次原样保留、未改动这些条目）；如需修复请重新拉框。"
+            )
         self._final_data_saved = True
 
         if silent:
@@ -3153,6 +3645,8 @@ class AnnotationEditor(QMainWindow):
 
     def show_new_task_dialog(self):
         """显示是否创建新任务的对话框"""
+        # 门闩回调已进场，切轮窗口结束，恢复采集/编辑入口（B2）
+        self._round_transition_pending = False
         # 确保主窗口在前台
         self.restore_window()
 
@@ -3197,8 +3691,15 @@ class AnnotationEditor(QMainWindow):
             # 更新任务指令
             self.task_instruction = new_instruction.strip()
 
-            # 重置状态并获取新的 gui_number
-            self.reset_for_new_task()
+            # 5.3（B7）顺序必须“先换编号、后重置”：reset_for_new_task 末尾按 DT-3
+            # 立即写一份空草稿，而此刻 gui_number 仍指向刚交付完成的旧目录，会把
+            # gui_N 重新标成「未完成任务」——重置期间抑制草稿写入，拿到新编号后由
+            # 采集流程自己落第一份草稿。
+            self._suppress_draft_write = True
+            try:
+                self.reset_for_new_task()
+            finally:
+                self._suppress_draft_write = False
             self.gui_number = self.data_manager.get_next_gui_number()
 
             self.status_label.setText(f"新任务开始 - 指令: {self.task_instruction}")
@@ -3210,6 +3711,8 @@ class AnnotationEditor(QMainWindow):
         """开始新一轮任务（同一 gui 文件夹内）
         :param from_answer: 是否从 answer 动作触发，如果是则取消时不保存退出
         """
+        # 门闩回调已进场，切轮窗口结束，恢复采集/编辑入口（B2）
+        self._round_transition_pending = False
         # 弹出对话框让用户输入新的 instruction
         from PyQt5.QtWidgets import QInputDialog
 
@@ -3318,14 +3821,16 @@ class AnnotationEditor(QMainWindow):
 
     def reset_for_new_task(self):
         """重置状态以开始新任务（保持 gui_number 不变）"""
+        # 5.3（B8）进入新的工作现场就清掉「已落盘」标志：该标志只对刚完成交付的
+        # 那批数据有效。不重置时，新任务中途关窗会被 closeEvent 当成“已保存”而
+        # 跳过草稿落盘，整轮进度静默丢失。
+        self._final_data_saved = False
         self.steps = []
         self.current_step_index = -1
         # 注意：不重置 gui_number，整个任务共用同一个文件夹
 
-        # 清空 stack widget（保留空页面）
-        while self.stack_widget.count() > 1:
-            widget = self.stack_widget.widget(1)
-            self.stack_widget.removeWidget(widget)
+        # 清空 stack widget（保留空页面；旧步骤页销毁掉，B15）
+        self._drop_all_step_pages()
 
         self.stack_widget.setCurrentIndex(0)
         self.update_step_indicator()
@@ -3364,55 +3869,17 @@ class AnnotationEditor(QMainWindow):
                 init_win.show()
                 init_win.raise_()
                 init_win.activateWindow()
-        elif not self._final_data_saved \
-                and (len(self.steps) > 0 or len(self.rounds) > 0):
+        elif not self._final_data_saved:
+            # 5.2（B9）中途关窗只落增量草稿，不写交付 JSON：旧实现在这里绕过必填
+            # 校验直接产出 gui_N.json，却不删草稿，于是同一个目录既「已完成」又
+            # 「可续采」，两个入口互不知晓、后写者覆盖前写者。口径对齐 iOS/Android：
+            # 交付只由「完成标注」路径产生，关窗进度靠草稿恢复。
             try:
-                self._save_all_data_before_close()
+                self._write_draft_now()
             except Exception as e:
-                print(f"关闭前保存数据失败: {e}")
+                print(f"关闭前写草稿失败: {e}")
 
         event.accept()
-
-    def _save_all_data_before_close(self):
-        """关闭窗口前保存所有数据到 JSON 文件（内部方法，不弹窗）"""
-        # 先保存当前轮次（如果有未落盘的步骤）
-        if len(self.steps) > 0:
-            self.save_current_round()
-
-        if len(self.rounds) == 0:
-            return
-
-        # 构建完整的 JSON 结构
-        merged_data = self.data_manager.create_initial_json_structure(
-            self.rounds[0].get("instruction", ""),
-            self.screen_info,
-            self.app_type
-        )
-
-        merged_data["messages"] = []
-        for round_data in self.rounds:
-            merged_data["messages"].append({
-                "role": "user",
-                "instruction": round_data["instruction"]
-            })
-            merged_data["messages"].append({
-                "role": "assistant",
-                "trajectory": round_data["trajectory"]
-            })
-
-        # 保存 JSON（失败时只打印日志，不阻塞关闭）
-        filepath = self.data_manager.save_json_data(merged_data, self.gui_number)
-        if filepath:
-            print(f"窗口关闭前已保存数据到: {filepath}")
-        else:
-            print("窗口关闭前保存 JSON 失败")
-
-        # 保存拉框坐标
-        if self.all_coords_entries:
-            try:
-                self.data_manager.save_coords_json(self.all_coords_entries, self.gui_number)
-            except Exception as e:
-                print(f"关闭前保存坐标 JSON 失败: {e}")
 
     def _return_to_init_menu(self):
         """返回任务初始化菜单"""
