@@ -2997,16 +2997,54 @@ class AnnotationEditor(QMainWindow):
                 + "\n".join(missing_files),
             )
 
+    # 受保护字段：新值为空（None/空串/空 dict/空 list）时保留旧值，
+    # 避免编辑保存把下游已填好的 CoT / active_window / ui_tree_segment /
+    # element / status 用空串覆盖
+    _PROTECTED_STEP_KEYS = ("CoT",)
+    _PROTECTED_OBSERVATION_KEYS = ("active_window", "ui_tree_segment")
+    _PROTECTED_ACTION_KEYS = ("element", "status")
+
+    @staticmethod
+    def _is_empty_protected_value(value):
+        """受保护字段的空值定义：None、空串、空 dict、空 list。"""
+        if value is None or value == "":
+            return True
+        if isinstance(value, (dict, list)) and len(value) == 0:
+            return True
+        return False
+
     @classmethod
-    def _merge_original_missing(cls, new_value, old_value):
-        """递归把旧结构里新结构缺失的键补上（新值优先，仅补键缺失）。"""
+    def _merge_protected_field(cls, merged, key, old_value, protected_keys):
+        """受保护字段：新值非空才覆盖，空值保留原值。"""
+        if key not in protected_keys:
+            return False
+        if key in merged and not cls._is_empty_protected_value(merged[key]):
+            return True
+        merged[key] = copy.deepcopy(old_value)
+        return True
+
+    @classmethod
+    def _merge_original_missing(cls, new_value, old_value, protected_keys=()):
+        """字段级递归合并（返回新对象，不原地修改入参）。
+
+        - 受保护字段（protected_keys）：新值非空才覆盖，空值保留旧值；
+        - 其余键：新结构缺失则深拷贝旧值；新旧同为 dict/list 时递归合并；
+        - 其余情况以新值为准。
+        """
         if isinstance(new_value, dict) and isinstance(old_value, dict):
             merged = copy.deepcopy(new_value)
             for key, value in old_value.items():
                 if key not in merged:
                     merged[key] = copy.deepcopy(value)
-                elif isinstance(merged[key], dict) and isinstance(value, dict):
-                    merged[key] = cls._merge_original_missing(merged[key], value)
+                    continue
+                if cls._merge_protected_field(merged, key, value, protected_keys):
+                    continue
+                if isinstance(merged[key], dict) and isinstance(value, dict):
+                    child_protected = ()
+                    if key == "observation":
+                        child_protected = cls._PROTECTED_OBSERVATION_KEYS
+                    merged[key] = cls._merge_original_missing(
+                        merged[key], value, child_protected)
                 elif isinstance(merged[key], list) and isinstance(value, list):
                     merged[key] = cls._merge_original_missing(merged[key], value)
             return merged
@@ -3015,11 +3053,13 @@ class AnnotationEditor(QMainWindow):
             merged = [copy.deepcopy(item) for item in new_value]
             for i, old_item in enumerate(old_value):
                 if i < len(merged):
-                    merged[i] = cls._merge_original_missing(merged[i], old_item)
+                    # trajectory 的 list 只有 actions：动作元素按动作受保护键合并
+                    merged[i] = cls._merge_original_missing(
+                        merged[i], old_item, cls._PROTECTED_ACTION_KEYS)
                 else:
                     merged.append(copy.deepcopy(old_item))
             return merged
-        return new_value
+        return copy.deepcopy(new_value)
 
     def save_edited_round(self, silent=False):
         """保存当前编辑轮次并写回最终 JSON / coords JSON。
@@ -3058,14 +3098,22 @@ class AnnotationEditor(QMainWindow):
         for i, step in enumerate(self.steps_data):
             action_data = copy.deepcopy(step.get("action_data") or {})
             filename = step.get("screenshot", "")
+            # steps_data 条目自身可能透传了下游字段（草稿续采场景）
+            step_obs = step.get("observation")
+            if isinstance(step_obs, dict):
+                active_window = step_obs.get("active_window", "")
+                ui_tree_segment = step_obs.get("ui_tree_segment", "")
+            else:
+                active_window = step.get("active_window", "")
+                ui_tree_segment = step.get("ui_tree_segment", "")
             new_traj = {
                 "step": i,
                 "intent": step.get("intent", ""),
-                "CoT": "",
+                "CoT": step.get("CoT", ""),
                 "observation": {
                     "screenshot": filename,
-                    "active_window": "",
-                    "ui_tree_segment": "",
+                    "active_window": active_window,
+                    "ui_tree_segment": ui_tree_segment,
                 },
                 "actions": [action_data],
             }
@@ -3078,7 +3126,13 @@ class AnnotationEditor(QMainWindow):
             if original is None and i < len(original_trajectory):
                 original = original_trajectory[i]
             if original is not None:
-                new_traj = self._merge_original_missing(new_traj, original)
+                # 字段级合并：CoT / active_window / ui_tree_segment / element /
+                # status 新值为空时保留原已交付值，不被空串覆盖。
+                # 终止类动作（terminate/answer）的 element=""、status="success"
+                # 由 _build_action_data 在重建动作时强制给出，非空新值自然胜出，
+                # 无需后置覆盖，避免给历史交付件中本无 status 键的条目凭空加键。
+                new_traj = self._merge_original_missing(
+                    new_traj, original, self._PROTECTED_STEP_KEYS)
             new_traj["step"] = i
             trajectory.append(new_traj)
 
@@ -3527,14 +3581,23 @@ class AnnotationEditor(QMainWindow):
 
         for i, step_data in enumerate(self.steps_data):
             action_data = step_data.get("action_data") or {}
+            # 下游字段（CoT/active_window/ui_tree_segment）可能由草稿透传，
+            # 有值则保留，无值维持空串，不再无条件硬编码覆盖
+            step_obs = step_data.get("observation")
+            if isinstance(step_obs, dict):
+                active_window = step_obs.get("active_window", "")
+                ui_tree_segment = step_obs.get("ui_tree_segment", "")
+            else:
+                active_window = step_data.get("active_window", "")
+                ui_tree_segment = step_data.get("ui_tree_segment", "")
             trajectory.append({
                 "step": i,
                 "intent": step_data.get("intent", ""),
-                "CoT": "",
+                "CoT": step_data.get("CoT", ""),
                 "observation": {
                     "screenshot": step_data.get("screenshot", ""),
-                    "active_window": "",
-                    "ui_tree_segment": ""
+                    "active_window": active_window,
+                    "ui_tree_segment": ui_tree_segment
                 },
                 # 2.7（B42）落轮必须存 action 的深拷贝：直接把 steps_data 里的活对象
                 # 塞进 rounds，会让 rounds 与本轮数据共享同一个 dict，任何对步骤

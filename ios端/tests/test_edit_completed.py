@@ -589,3 +589,639 @@ def test_center_mismatch_not_loaded_and_disk_entry_preserved(
     assert after["messages"][1]["trajectory"][0]["intent"] == "只改动作描述"
     assert after["messages"][1]["trajectory"][1]["actions"][0]["coordinate"] == [300, 400]
     assert after["messages"][1]["trajectory"][1]["actions"][0]["pixels"] == -120
+
+
+# ----------------------------------------------------------------------
+# 7. 已完成轮次编辑：受保护字段（CoT / active_window / ui_tree_segment /
+#    element / status）与未知键保留，被编辑字段为新值，原始数据不被污染
+# ----------------------------------------------------------------------
+
+def _protected_dataset(base_dir):
+    """单轮两步数据集：首步带非空受保护字段与未知键，供编辑保存回归。"""
+    gui_dir = os.path.join(base_dir, GUI_DIR_NAME)
+    os.makedirs(gui_dir, exist_ok=True)
+
+    names = [f"gui_{GUI_NUMBER}_{i:04d}.png" for i in range(1, 3)]
+    fake = FakeScreenCapture()
+    for name in names:
+        fake.capture(os.path.join(gui_dir, name))
+
+    trajectory = [
+        {
+            "step": 0,
+            "intent": "打开设置",
+            "CoT": "下游已填的思维链",
+            "unknown_step_key": "保留我",
+            "observation": {
+                "screenshot": names[0],
+                "active_window": "设置主页",
+                "ui_tree_segment": {"nodes": ["a", "b"]},
+                "unknown_obs_key": 42,
+            },
+            "actions": [
+                {
+                    "action": "click",
+                    "element": "设置图标",
+                    "status": "success",
+                    "coordinate": [100, 250],
+                    "unknown_action_key": ["x", "y"],
+                }
+            ],
+        },
+        {
+            "step": 1,
+            "intent": "点击搜索",
+            "CoT": "第二步思维链",
+            "observation": {
+                "screenshot": names[1],
+                "active_window": "搜索页",
+                "ui_tree_segment": {"nodes": ["c"]},
+            },
+            "actions": [
+                {"action": "click", "element": "搜索框", "status": "success",
+                 "coordinate": [200, 400]}
+            ],
+        },
+    ]
+    data = {
+        "platform": "iOS",
+        "system": "iOS 17.0",
+        "screen_size": [390, 844],
+        "task_type": "iOS-社交",
+        "messages": [
+            {"role": "user", "instruction": "唯一轮指令"},
+            {"role": "assistant", "trajectory": trajectory},
+        ],
+    }
+    coords = [
+        {"step": 0, "action": "click", "vertices": [50, 200, 150, 300],
+         "center": [100, 250]},
+        {"step": 1, "action": "click", "vertices": [150, 350, 250, 450],
+         "center": [200, 400]},
+    ]
+    with open(os.path.join(gui_dir, f"gui_{GUI_NUMBER}.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(gui_dir, f"gui_{GUI_NUMBER}_coords.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(coords, f, ensure_ascii=False, indent=2)
+    return gui_dir, data, coords
+
+
+def test_save_edited_round_keeps_protected_fields_and_unknown_keys(tmp_path, qapp):
+    gui_dir, data, coords = _protected_dataset(str(tmp_path))
+    original_snapshot = copy.deepcopy(data)
+    editor = _make_editor(str(tmp_path), qapp)
+    try:
+        editor.load_from_completed_json(data, coords, 0, gui_dir)
+
+        # 编辑首步：改意图与坐标（动作仍是 click），再确认落表
+        editor.intent_input.setText("打开设置-改")
+        editor.coord_x_input.setText("111")
+        editor.coord_y_input.setText("222")
+        editor.confirm_step()
+        qapp.processEvents()
+
+        assert editor.save_edited_round(False) is True
+        qapp.processEvents()
+
+        # 编辑器内缓存的原始已完成数据不被保存流程污染
+        assert editor._completed_json == original_snapshot
+    finally:
+        _dispose(editor, qapp, allow_write=False)
+
+    saved = _load_json(gui_dir)
+    traj = saved["messages"][1]["trajectory"]
+    first = traj[0]
+
+    # 受保护字段原样保留
+    assert first["CoT"] == "下游已填的思维链"
+    assert first["observation"]["active_window"] == "设置主页"
+    assert first["observation"]["ui_tree_segment"] == {"nodes": ["a", "b"]}
+    assert first["actions"][0]["element"] == "设置图标"
+    assert first["actions"][0]["status"] == "success"
+    # 未知键（步骤层 / observation 层 / action 层）深拷贝保留
+    assert first["unknown_step_key"] == "保留我"
+    assert first["observation"]["unknown_obs_key"] == 42
+    assert first["actions"][0]["unknown_action_key"] == ["x", "y"]
+    # 被编辑字段是新值
+    assert first["intent"] == "打开设置-改"
+    assert first["actions"][0]["coordinate"] == [111, 222]
+    # 未编辑步骤逐字段不变
+    assert traj[1] == data["messages"][1]["trajectory"][1]
+    # 磁盘上的原始入参 data 也未被原地改写
+    assert data == original_snapshot
+
+
+# ----------------------------------------------------------------------
+# 8. 草稿序列化：_serialize_step 全键透传，screenshot_filepath 排除规则不变
+# ----------------------------------------------------------------------
+
+def test_serialize_step_passes_through_optional_keys_and_drops_filepath():
+    step = {
+        "screenshot": "gui_000001_0001.png",
+        "screenshot_filepath": os.path.join("C:", "abs", "path",
+                                            "gui_000001_0001.png"),
+        "intent": "打开设置",
+        "action_data": {"action": "click", "coordinate": [1, 2]},
+        "vertices": [0, 0, 10, 10],
+        "CoT": "草稿思维链",
+        "active_window": "设置页",
+        "ui_tree_segment": {"nodes": [1]},
+        "observation": {
+            "active_window": "观察承载窗口",
+            "ui_tree_segment": {"nodes": [2]},
+        },
+    }
+    serialized = AnnotationEditor._serialize_step(step)
+
+    # 全键透传（含平铺可选键与 observation dict 两种承载）
+    assert serialized["CoT"] == "草稿思维链"
+    assert serialized["active_window"] == "设置页"
+    assert serialized["ui_tree_segment"] == {"nodes": [1]}
+    assert serialized["observation"] == {
+        "active_window": "观察承载窗口",
+        "ui_tree_segment": {"nodes": [2]},
+    }
+    assert serialized["action_data"] == step["action_data"]
+    # 运行态绝对路径永不落盘
+    assert "screenshot_filepath" not in serialized
+    assert serialized["screenshot"] == "gui_000001_0001.png"
+
+    # 深拷贝隔离：改返回值不影响入参
+    serialized["ui_tree_segment"]["nodes"].append(9)
+    serialized["observation"]["ui_tree_segment"]["nodes"].append(9)
+    assert step["ui_tree_segment"] == {"nodes": [1]}
+    assert step["observation"]["ui_tree_segment"] == {"nodes": [2]}
+
+
+def test_serialize_step_legacy_shape_stays_identical():
+    """无可选键时序列化结果与旧格式逐字一致（仅剔除 screenshot_filepath）。"""
+    step = {
+        "screenshot": "gui_000001_0001.png",
+        "screenshot_filepath": os.path.join("C:", "abs", "gui_000001_0001.png"),
+        "intent": "点击",
+        "action_data": {"action": "click", "coordinate": [1, 2]},
+        "vertices": None,
+    }
+    serialized = AnnotationEditor._serialize_step(step)
+    assert serialized == {
+        "screenshot": "gui_000001_0001.png",
+        "intent": "点击",
+        "action_data": {"action": "click", "coordinate": [1, 2]},
+        "vertices": None,
+    }
+    assert "CoT" not in serialized
+    assert "active_window" not in serialized
+    assert "ui_tree_segment" not in serialized
+    assert "observation" not in serialized
+
+
+# ----------------------------------------------------------------------
+# 9. 落轮透传：_save_current_round_to_list 的 .get 三字段透传
+# ----------------------------------------------------------------------
+
+def _bare_editor():
+    """绕过 QWidget 初始化的裸实例，仅用于不依赖 UI 状态的纯数据方法。"""
+    return AnnotationEditor.__new__(AnnotationEditor)
+
+
+def test_save_current_round_to_list_passes_optional_fields_through(tmp_path, qapp):
+    gui_dir, _data, _coords = _protected_dataset(str(tmp_path))
+    editor = _make_editor(str(tmp_path), qapp)
+    try:
+        editor.task_instruction = "落轮指令"
+        editor.rounds = []
+        editor.steps_data = [
+            {
+                "screenshot": "gui_000001_0001.png",
+                "screenshot_filepath": os.path.join(
+                    gui_dir, "gui_000001_0001.png"),
+                "intent": "带透传字段的步",
+                "action_data": {"action": "click", "coordinate": [1, 2],
+                                "element": "图标", "status": "success"},
+                "vertices": [0, 0, 10, 10],
+                "CoT": "落轮思维链",
+                "active_window": "平铺窗口",
+                "ui_tree_segment": {"nodes": ["t"]},
+            },
+            {
+                "screenshot": "gui_000001_0002.png",
+                "screenshot_filepath": os.path.join(
+                    gui_dir, "gui_000001_0002.png"),
+                "intent": "observation 承载的步",
+                "action_data": {"action": "terminate", "element": "",
+                                "status": "success"},
+                "vertices": None,
+                "observation": {
+                    "active_window": "dict 窗口",
+                    "ui_tree_segment": {"nodes": ["o"]},
+                },
+            },
+        ]
+        # 落轮尾部会立即写草稿，编辑模式下直接短路，不产生磁盘文件
+        editor._edit_mode = True
+
+        assert editor._save_current_round_to_list(False) is True
+
+        assert len(editor.rounds) == 1
+        traj = editor.rounds[0]["trajectory"]
+        assert traj[0]["CoT"] == "落轮思维链"
+        assert traj[0]["observation"]["active_window"] == "平铺窗口"
+        assert traj[0]["observation"]["ui_tree_segment"] == {"nodes": ["t"]}
+        assert traj[1]["CoT"] == ""
+        assert traj[1]["observation"]["active_window"] == "dict 窗口"
+        assert traj[1]["observation"]["ui_tree_segment"] == {"nodes": ["o"]}
+        # 结构固定，不引入额外键
+        for entry in traj:
+            assert set(entry.keys()) == {"step", "intent", "CoT",
+                                         "observation", "actions"}
+            assert set(entry["observation"].keys()) == {
+                "screenshot", "active_window", "ui_tree_segment"}
+        assert editor.steps_data == []
+    finally:
+        _dispose(editor, qapp, allow_write=False)
+
+
+def test_save_current_round_to_list_defaults_to_empty_strings(tmp_path, qapp):
+    editor = _make_editor(str(tmp_path), qapp)
+    try:
+        editor.task_instruction = "无透传字段指令"
+        editor.rounds = []
+        editor.steps_data = [
+            {
+                "screenshot": "gui_000001_0001.png",
+                "screenshot_filepath": "",
+                "intent": "裸步",
+                "action_data": {"action": "click", "coordinate": [1, 2]},
+                "vertices": None,
+            },
+        ]
+        editor._edit_mode = True
+
+        assert editor._save_current_round_to_list(False) is True
+
+        entry = editor.rounds[0]["trajectory"][0]
+        assert entry["CoT"] == ""
+        assert entry["observation"]["active_window"] == ""
+        assert entry["observation"]["ui_tree_segment"] == ""
+        assert set(entry.keys()) == {"step", "intent", "CoT",
+                                     "observation", "actions"}
+    finally:
+        _dispose(editor, qapp, allow_write=False)
+
+
+# ----------------------------------------------------------------------
+# 10. 终止类专项：terminate / answer 编辑保存后 element==""、status=="success"，
+#     步骤级三字段仍保留
+# ----------------------------------------------------------------------
+
+def _terminate_dataset(base_dir):
+    gui_dir = os.path.join(base_dir, GUI_DIR_NAME)
+    os.makedirs(gui_dir, exist_ok=True)
+
+    names = [f"gui_{GUI_NUMBER}_{i:04d}.png" for i in range(1, 3)]
+    fake = FakeScreenCapture()
+    for name in names:
+        fake.capture(os.path.join(gui_dir, name))
+
+    trajectory = [
+        {
+            "step": 0,
+            "intent": "任务收尾",
+            "CoT": "终止步思维链",
+            "observation": {
+                "screenshot": names[0],
+                "active_window": "终态窗口",
+                "ui_tree_segment": {"nodes": ["term"]},
+            },
+            "actions": [
+                {"action": "terminate", "element": "", "status": "success"}
+            ],
+        },
+        {
+            "step": 1,
+            "intent": "回答问题",
+            "CoT": "回答步思维链",
+            "observation": {
+                "screenshot": names[1],
+                "active_window": "问答窗口",
+                "ui_tree_segment": {"nodes": ["ans"]},
+            },
+            "actions": [
+                {"action": "answer", "text": "最终答案", "element": "",
+                 "status": "success"}
+            ],
+        },
+    ]
+    data = {
+        "platform": "iOS",
+        "system": "iOS 17.0",
+        "screen_size": [390, 844],
+        "task_type": "iOS-社交",
+        "messages": [
+            {"role": "user", "instruction": "终止类轮次"},
+            {"role": "assistant", "trajectory": trajectory},
+        ],
+    }
+    coords = [
+        {"step": 0, "action": "terminate"},
+        {"step": 1, "action": "answer", "center": [0, 0]},
+    ]
+    with open(os.path.join(gui_dir, f"gui_{GUI_NUMBER}.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(gui_dir, f"gui_{GUI_NUMBER}_coords.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(coords, f, ensure_ascii=False, indent=2)
+    return gui_dir, data, coords
+
+
+def test_terminate_and_answer_keep_empty_element_success_status(tmp_path, qapp):
+    gui_dir, data, coords = _terminate_dataset(str(tmp_path))
+    editor = _make_editor(str(tmp_path), qapp)
+    try:
+        editor.load_from_completed_json(data, coords, 0, gui_dir)
+
+        # 首步 terminate：仅改意图后确认，动作仍为 terminate
+        assert (editor.action_combo.currentData()
+                or editor.action_combo.currentText()) in (
+            "terminate", "任务完成 (terminate)")
+        editor.intent_input.setText("任务收尾-改")
+        editor.confirm_step()
+        qapp.processEvents()
+
+        # 第二步 answer：改回答文本
+        editor.jump_to_step(1)
+        qapp.processEvents()
+        editor.text_input.setText("更新后的答案")
+        editor.confirm_step()
+        qapp.processEvents()
+
+        assert editor.save_edited_round(False) is True
+        qapp.processEvents()
+    finally:
+        _dispose(editor, qapp, allow_write=False)
+
+    traj = _load_json(gui_dir)["messages"][1]["trajectory"]
+    term_action = traj[0]["actions"][0]
+    ans_action = traj[1]["actions"][0]
+    assert term_action["action"] == "terminate"
+    assert term_action["element"] == ""
+    assert term_action["status"] == "success"
+    assert ans_action["action"] == "answer"
+    assert ans_action["element"] == ""
+    assert ans_action["status"] == "success"
+    assert ans_action["text"] == "更新后的答案"
+    # 步骤级三字段仍保留
+    assert traj[0]["CoT"] == "终止步思维链"
+    assert traj[0]["observation"]["active_window"] == "终态窗口"
+    assert traj[0]["observation"]["ui_tree_segment"] == {"nodes": ["term"]}
+    assert traj[1]["CoT"] == "回答步思维链"
+    assert traj[1]["observation"]["active_window"] == "问答窗口"
+    assert traj[1]["observation"]["ui_tree_segment"] == {"nodes": ["ans"]}
+
+
+# ----------------------------------------------------------------------
+# 11. _merge_original_missing 直接单测：空值回退 / 非空覆盖 / 非原地 /
+#     深拷贝隔离 / actions 超长下标保留
+# ----------------------------------------------------------------------
+
+def test_merge_protected_empty_values_fall_back_to_original():
+    editor = _bare_editor()
+    old = {
+        "CoT": "原 CoT",
+        "observation": {
+            "active_window": "原窗口",
+            "ui_tree_segment": {"nodes": [1]},
+        },
+        "actions": [
+            {"element": "原元素", "status": "原状态", "action": "click"},
+        ],
+    }
+    new = {
+        "CoT": "",
+        "observation": {
+            "active_window": None,
+            "ui_tree_segment": {},
+        },
+        "actions": [
+            {"element": "", "status": "", "action": "click"},
+        ],
+    }
+    merged = editor._merge_original_missing(
+        new, old, AnnotationEditor._PROTECTED_STEP_KEYS)
+
+    assert merged["CoT"] == "原 CoT"
+    assert merged["observation"]["active_window"] == "原窗口"
+    assert merged["observation"]["ui_tree_segment"] == {"nodes": [1]}
+    assert merged["actions"][0]["element"] == "原元素"
+    assert merged["actions"][0]["status"] == "原状态"
+
+
+def test_merge_protected_non_empty_values_override():
+    editor = _bare_editor()
+    old = {
+        "CoT": "原 CoT",
+        "observation": {
+            "active_window": "原窗口",
+            "ui_tree_segment": {"nodes": [1]},
+        },
+        "actions": [
+            {"element": "原元素", "status": "原状态",
+             "action": "click", "coordinate": [1, 1]},
+        ],
+    }
+    new = {
+        "CoT": "新 CoT",
+        "observation": {
+            "active_window": "新窗口",
+            "ui_tree_segment": {"nodes": [2]},
+        },
+        "actions": [
+            {"element": "新元素", "status": "新状态",
+             "action": "click", "coordinate": [2, 2]},
+        ],
+    }
+    merged = editor._merge_original_missing(
+        new, old, AnnotationEditor._PROTECTED_STEP_KEYS)
+
+    assert merged["CoT"] == "新 CoT"
+    assert merged["observation"]["active_window"] == "新窗口"
+    assert merged["observation"]["ui_tree_segment"] == {"nodes": [2]}
+    assert merged["actions"][0]["element"] == "新元素"
+    assert merged["actions"][0]["status"] == "新状态"
+    assert merged["actions"][0]["coordinate"] == [2, 2]
+
+
+def test_merge_does_not_mutate_inputs_and_deep_copies():
+    editor = _bare_editor()
+    old = {
+        "CoT": "原 CoT",
+        "unknown": {"nested": [1, 2]},
+        "observation": {"active_window": "原窗口",
+                        "ui_tree_segment": {"nodes": [1]}},
+        "actions": [
+            {"element": "原元素", "status": "s", "action": "click",
+             "extra": {"k": ["v"]}},
+            {"element": "超长下标元素", "status": "s2", "action": "scroll"},
+        ],
+    }
+    old_snapshot = copy.deepcopy(old)
+    new = {
+        "CoT": "",
+        "observation": {"active_window": "", "ui_tree_segment": ""},
+        "actions": [
+            {"element": "", "status": "", "action": "click"},
+        ],
+    }
+    new_snapshot = copy.deepcopy(new)
+
+    merged = editor._merge_original_missing(
+        new, old, AnnotationEditor._PROTECTED_STEP_KEYS)
+
+    # 入参原样不动
+    assert old == old_snapshot
+    assert new == new_snapshot
+
+    # old 有 new 无的键深拷贝保留
+    assert merged["unknown"] == {"nested": [1, 2]}
+    # actions 超长下标元素深拷贝保留
+    assert len(merged["actions"]) == 2
+    assert merged["actions"][1] == {
+        "element": "超长下标元素", "status": "s2", "action": "scroll"}
+
+    # 深拷贝隔离：改 merged 不回写 old/new
+    merged["unknown"]["nested"].append(3)
+    merged["observation"]["ui_tree_segment"]["nodes"].append(9)
+    merged["actions"][0]["extra"]["k"].append("mutated")
+    merged["actions"][1]["element"] = "被改了"
+    assert old["unknown"] == {"nested": [1, 2]}
+    assert old["observation"]["ui_tree_segment"] == {"nodes": [1]}
+    assert old["actions"][0]["extra"] == {"k": ["v"]}
+    assert old["actions"][1]["element"] == "超长下标元素"
+    assert new == new_snapshot
+
+
+def test_merge_non_dict_falls_back_to_new_value():
+    editor = _bare_editor()
+    # 标量场景：以新值为准（深拷贝）
+    assert editor._merge_original_missing("新", "旧") == "新"
+    assert editor._merge_original_missing(None, "旧") is None
+    # 空 list / 空 dict 的受保护空值判定
+    assert AnnotationEditor._is_empty_protected_value(None) is True
+    assert AnnotationEditor._is_empty_protected_value("") is True
+    assert AnnotationEditor._is_empty_protected_value({}) is True
+    assert AnnotationEditor._is_empty_protected_value([]) is True
+    assert AnnotationEditor._is_empty_protected_value(0) is False
+    assert AnnotationEditor._is_empty_protected_value("x") is False
+    assert AnnotationEditor._is_empty_protected_value({"a": 1}) is False
+
+
+# ----------------------------------------------------------------------
+# 12. 草稿往返：_write_draft_now -> data_manager.load_draft 保留三字段；
+#     无可选键时磁盘结构不新增键（与修复前逐字一致）
+# ----------------------------------------------------------------------
+
+def _new_draft_editor(base_dir, qapp):
+    """构造非编辑态编辑器，仅供草稿写盘/读盘（不初始化新任务目录）。"""
+    editor = _make_editor(base_dir, qapp)
+    editor.gui_number = GUI_NUMBER
+    editor.gui_dir = os.path.join(base_dir, GUI_DIR_NAME)
+    return editor
+
+
+def test_draft_optional_keys_round_trip_flat_and_observation(tmp_path, qapp):
+    """草稿写盘/读盘对称保留 CoT / active_window / ui_tree_segment。
+
+    编辑已完成轮次时这三字段来自下游 JSON；草稿序列化一旦丢弃它们，断点续采
+    后再次保存就会用空值覆盖下游结果，正是本次修复要堵住的数据丢失路径。
+    """
+    gui_dir = os.path.join(str(tmp_path), GUI_DIR_NAME)
+    os.makedirs(gui_dir, exist_ok=True)
+
+    flat_step = {
+        "screenshot": "gui_000001_0001.png",
+        "screenshot_filepath": os.path.join(gui_dir, "gui_000001_0001.png"),
+        "intent": "平铺承载步",
+        "action_data": {"action": "click", "coordinate": [1, 2],
+                        "element": "图标", "status": "success"},
+        "vertices": [0, 0, 10, 10],
+        "CoT": "平铺 CoT",
+        "active_window": "平铺窗口",
+        "ui_tree_segment": {"nodes": ["flat"]},
+    }
+    obs_step = {
+        "screenshot": "gui_000001_0002.png",
+        "screenshot_filepath": os.path.join(gui_dir, "gui_000001_0002.png"),
+        "intent": "observation 承载步",
+        "action_data": {"action": "terminate", "element": "",
+                        "status": "success"},
+        "vertices": None,
+        "observation": {
+            "active_window": "dict 窗口",
+            "ui_tree_segment": {"nodes": ["obs"]},
+        },
+    }
+
+    editor = _new_draft_editor(str(tmp_path), qapp)
+    try:
+        editor.task_instruction = "草稿指令"
+        editor.steps_data = [copy.deepcopy(flat_step), copy.deepcopy(obs_step)]
+        # 无当前截图：_write_draft_now 全量按 steps_data 序列化，不掺入空表单
+        editor._current_screenshot_filename = None
+        editor.draft_timer.stop()
+
+        editor._write_draft_now()
+        qapp.processEvents()
+
+        draft = editor.data_manager.load_draft(GUI_NUMBER)
+        assert draft is not None
+        written = draft["steps_data"]
+        # 平铺三字段与 observation dict 两种承载都原样落盘
+        assert written[0]["CoT"] == "平铺 CoT"
+        assert written[0]["active_window"] == "平铺窗口"
+        assert written[0]["ui_tree_segment"] == {"nodes": ["flat"]}
+        assert written[1]["observation"] == {
+            "active_window": "dict 窗口",
+            "ui_tree_segment": {"nodes": ["obs"]},
+        }
+        # 运行态绝对路径永不落盘
+        for step in written:
+            assert "screenshot_filepath" not in step
+    finally:
+        _dispose(editor, qapp, allow_write=False)
+
+
+def test_draft_without_optional_keys_keeps_legacy_shape(tmp_path, qapp):
+    """条目本身不带可选键时，写盘结果不新增这些键（与修复前逐字一致）。"""
+    gui_dir = os.path.join(str(tmp_path), GUI_DIR_NAME)
+    os.makedirs(gui_dir, exist_ok=True)
+
+    legacy_step = {
+        "screenshot": "gui_000001_0001.png",
+        "intent": "旧格式步",
+        "action_data": {"action": "click", "coordinate": [1, 2]},
+        "vertices": None,
+    }
+
+    editor = _new_draft_editor(str(tmp_path), qapp)
+    try:
+        editor.task_instruction = "旧格式草稿"
+        editor.steps_data = [copy.deepcopy(legacy_step)]
+        editor._current_screenshot_filename = None
+        editor.draft_timer.stop()
+
+        editor._write_draft_now()
+        qapp.processEvents()
+
+        draft = editor.data_manager.load_draft(GUI_NUMBER)
+        assert draft is not None
+        assert draft["steps_data"] == [legacy_step]
+        for step in draft["steps_data"]:
+            assert "CoT" not in step
+            assert "active_window" not in step
+            assert "ui_tree_segment" not in step
+            assert "observation" not in step
+    finally:
+        _dispose(editor, qapp, allow_write=False)

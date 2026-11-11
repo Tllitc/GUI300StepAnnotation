@@ -2361,6 +2361,13 @@ class AnnotationEditor(QMainWindow):
         # 设置截图文件名
         step_data["observation"]["screenshot"] = current_step["screenshot_filename"]
 
+        # 编辑已存在步骤（草稿/续采/编辑模式）：与原快照合并，受保护下游字段空值
+        # 保留原值，避免编辑器重建字典把下游字段清空；新增步骤无原 data，直接写入
+        original_data = current_step.get("data")
+        if isinstance(original_data, dict):
+            step_data = self._merge_step_with_original(step_data, original_data)
+            step_data["observation"]["screenshot"] = current_step["screenshot_filename"]
+
         # 当前步骤确认落快照，运行时标志置为已确认（answer/terminate 分支随后会清空 steps）
         previous_confirmed = current_step.get("confirmed", False)
         current_step["confirmed"] = True
@@ -2508,6 +2515,13 @@ class AnnotationEditor(QMainWindow):
             editor = step["editor"]
             step_data = copy.deepcopy(editor.get_data())
             step_data.setdefault("observation", {})["screenshot"] = step["screenshot_filename"]
+            # 与旧 data 快照合并：编辑器重建字典时空值的受保护下游字段
+            # （CoT/observation.ui_tree_segment/active_window、动作 element/status）
+            # 保留快照原值；新增步骤无快照则跳过
+            original_data = step.get("data")
+            if isinstance(original_data, dict):
+                step_data = self._merge_step_with_original(step_data, original_data)
+                step_data.setdefault("observation", {})["screenshot"] = step["screenshot_filename"]
             # step 字段放在首部，值为当前 enumerate 下标
             existing_step = step_data.pop("step", None)
             if existing_step != i:
@@ -2568,6 +2582,11 @@ class AnnotationEditor(QMainWindow):
             except Exception:
                 step_data = copy.deepcopy(step.get("data") or {})
             step_data.setdefault("observation", {})["screenshot"] = step["screenshot_filename"]
+            # 与旧 data 快照合并：编辑器重建字典时空值的受保护下游字段保留快照原值
+            original_data = step.get("data")
+            if isinstance(original_data, dict):
+                step_data = self._merge_step_with_original(step_data, original_data)
+                step_data.setdefault("observation", {})["screenshot"] = step["screenshot_filename"]
             # 补齐 step 字段（放在首部）
             if step_data.get("step") != i:
                 step_data = {"step": i, **{k: v for k, v in step_data.items() if k != "step"}}
@@ -2954,28 +2973,94 @@ class AnnotationEditor(QMainWindow):
                 return item
         return None
 
+    # 编辑器不采集、重建步骤字典时可能被写成空值的下游字段：
+    # 步骤级 CoT；observation 内嵌 active_window / ui_tree_segment；
+    # 动作级 element / status（终止类动作的这两个字段走业务规则，不参与保留合并）
+    _PROTECTED_STEP_FIELDS = ("CoT",)
+    _PROTECTED_OBSERVATION_FIELDS = ("active_window", "ui_tree_segment")
+    _PROTECTED_ACTION_FIELDS = ("element", "status")
+    _TERMINAL_ACTIONS = ("terminate", "answer", "answer_terminate")
+
+    @staticmethod
+    def _is_empty_protected_value(value):
+        """受保护字段的空值判定：None、空字符串、空 dict、空 list 视为空"""
+        if value is None:
+            return True
+        if isinstance(value, str) and value == "":
+            return True
+        if isinstance(value, (dict, list)) and len(value) == 0:
+            return True
+        return False
+
     def _merge_step_with_original(self, new_step, original_step):
-        """把原步骤中新数据缺失的键递归补上（新值优先），保留未暴露字段"""
+        """合并重建步骤与原步骤：受保护下游字段空值不覆盖原值，其余新值优先。
+
+        - 受保护字段（CoT / observation.active_window / observation.ui_tree_segment /
+          非终止动作的 element、status）：new 非空用 new，new 为空且 original 有该键
+          时保留 original 值；original 没有该键则保留 new 的空值，不引入新键。
+        - 终止类动作（terminate / answer / answer_terminate）保持业务规则：
+          element 恒为 ""、status 恒为 "success"，不做保留合并。
+        - 其余键：new 有的以 new 为准；original 有而 new 缺失的键深拷贝保留。
+        返回新 dict，不原地修改入参。
+        """
         if not isinstance(original_step, dict):
-            return new_step
+            return copy.deepcopy(new_step)
         if not isinstance(new_step, dict):
             return copy.deepcopy(original_step)
 
         merged = copy.deepcopy(new_step)
+
+        # 受保护步骤级字段：空值回退为原值（仅当原步骤存在该键）
+        for field in self._PROTECTED_STEP_FIELDS:
+            if field in merged and self._is_empty_protected_value(merged[field]) \
+                    and field in original_step:
+                merged[field] = copy.deepcopy(original_step[field])
+
+        # observation 按字段级合并：screenshot 等非保护字段一律以 new 为准
+        new_observation = merged.get("observation")
+        old_observation = original_step.get("observation")
+        if isinstance(new_observation, dict) and isinstance(old_observation, dict):
+            for field in self._PROTECTED_OBSERVATION_FIELDS:
+                if field in new_observation \
+                        and self._is_empty_protected_value(new_observation[field]) \
+                        and field in old_observation:
+                    new_observation[field] = copy.deepcopy(old_observation[field])
+
+        # 动作级合并：只处理 actions[0]，终止类动作不保留 element/status
+        new_actions = merged.get("actions")
+        old_actions = original_step.get("actions")
+        if isinstance(new_actions, list) and isinstance(old_actions, list) \
+                and new_actions and isinstance(new_actions[0], dict) \
+                and len(old_actions) > 0 and isinstance(old_actions[0], dict):
+            new_action = new_actions[0]
+            old_action = old_actions[0]
+            is_terminal = new_action.get("action") in self._TERMINAL_ACTIONS
+            if is_terminal:
+                new_action["element"] = ""
+                new_action["status"] = "success"
+            else:
+                for field in self._PROTECTED_ACTION_FIELDS:
+                    if field in new_action \
+                            and self._is_empty_protected_value(new_action[field]) \
+                            and field in old_action:
+                        new_action[field] = copy.deepcopy(old_action[field])
+
+        # 其余所有键：original 有而 new 缺失的，原样深拷贝保留（含未知键）
         for key, old_value in original_step.items():
             if key not in merged:
                 merged[key] = copy.deepcopy(old_value)
-                continue
-            new_value = merged[key]
-            if isinstance(new_value, dict) and isinstance(old_value, dict):
-                merged[key] = self._merge_step_with_original(new_value, old_value)
-            elif isinstance(new_value, list) and isinstance(old_value, list):
-                merged[key] = [
-                    self._merge_step_with_original(item, old_value[i])
-                    if isinstance(item, dict) and i < len(old_value)
-                    and isinstance(old_value[i], dict) else item
-                    for i, item in enumerate(new_value)
-                ]
+        # observation / actions 内部的未知键同样补齐
+        if isinstance(new_observation, dict) and isinstance(old_observation, dict):
+            for key, old_value in old_observation.items():
+                if key not in new_observation:
+                    new_observation[key] = copy.deepcopy(old_value)
+        if isinstance(new_actions, list) and isinstance(old_actions, list) \
+                and new_actions and isinstance(new_actions[0], dict) \
+                and len(old_actions) > 0 and isinstance(old_actions[0], dict):
+            for key, old_value in old_actions[0].items():
+                if key not in new_actions[0]:
+                    new_actions[0][key] = copy.deepcopy(old_value)
+
         return merged
 
     def save_edited_round(self, silent=False):

@@ -503,3 +503,677 @@ def test_missing_fields_block_save_without_touching_json(tmp_path, qapp, modal):
             editor.close()
         except Exception:
             pass
+
+
+# ----------------------------------------------------------------------
+# 9. 已完成轮次编辑：受保护字段（CoT / active_window / ui_tree_segment /
+#    element / status）与未知键保留，被编辑字段为新值，原始数据不被污染
+# ----------------------------------------------------------------------
+
+def _build_protected_dataset(base_dir):
+    """单轮两步：首步带非空受保护字段与各层未知键，供编辑保存回归。"""
+    gui_dir = os.path.join(str(base_dir), f"gui_{GUI_NUM}")
+    os.makedirs(gui_dir, exist_ok=True)
+
+    names = [f"gui_{GUI_NUM}_{i:04d}.png" for i in range(1, 3)]
+    for i, name in enumerate(names, start=1):
+        _write_png(os.path.join(gui_dir, name), i)
+
+    trajectory = [
+        {
+            "step": 0,
+            "intent": "打开设置",
+            "CoT": "下游已填的思维链",
+            "unknown_step_key": "保留我",
+            "observation": {
+                "screenshot": names[0],
+                "active_window": "设置主页",
+                "ui_tree_segment": {"nodes": ["a", "b"]},
+                "unknown_obs_key": 42,
+            },
+            "actions": [
+                {
+                    "action": "click",
+                    "element": "设置图标",
+                    "status": "success",
+                    "coordinate": [100, 200],
+                    "unknown_action_key": ["x", "y"],
+                }
+            ],
+        },
+        {
+            "step": 1,
+            "intent": "点击搜索",
+            "CoT": "第二步思维链",
+            "observation": {
+                "screenshot": names[1],
+                "active_window": "搜索页",
+                "ui_tree_segment": {"nodes": ["c"]},
+            },
+            "actions": [
+                {"action": "click", "element": "搜索框", "status": "success",
+                 "coordinate": [200, 400]}
+            ],
+        },
+    ]
+    data = {
+        "platform": "Android",
+        "system": "Android 13",
+        "screen_size": [360, 640],
+        "task_type": "Android-社交",
+        "messages": [
+            {"role": "user", "instruction": "唯一轮指令"},
+            {"role": "assistant", "trajectory": trajectory},
+        ],
+    }
+    coords_entries = [
+        {"step": 0, "action": "click", "vertices": [50, 150, 150, 250],
+         "center": [100, 200]},
+        {"step": 1, "action": "click", "vertices": [150, 350, 250, 450],
+         "center": [200, 400]},
+    ]
+    with open(os.path.join(gui_dir, f"gui_{GUI_NUM}.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(gui_dir, f"gui_{GUI_NUM}_coords.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"version": "3.0", "coords": coords_entries}, f,
+                  ensure_ascii=False, indent=2)
+    return gui_dir, data, coords_entries
+
+
+def test_save_edited_round_keeps_protected_fields_and_unknown_keys(tmp_path, qapp, modal):
+    gui_dir, data, coords_entries = _build_protected_dataset(tmp_path)
+    original_snapshot = copy.deepcopy(data)
+    editor = _load_editor(tmp_path, gui_dir, data, coords_entries, round_index=0)
+    try:
+        # 编辑首步：改意图与坐标（动作仍是 click），再确认落表
+        editor.intent_input.setText("打开设置-改")
+        editor.coord_x_input.setText("111")
+        editor.coord_y_input.setText("222")
+        editor._current_vertices = [60, 170, 160, 270]
+        editor.confirm_step()
+        flush_events()
+
+        assert editor.save_edited_round(False) is True
+        flush_events(50)
+
+        # 编辑器内缓存的原始已完成数据不被保存流程污染
+        assert editor._completed_json == original_snapshot
+    finally:
+        editor._edit_final_saved = True
+        try:
+            editor.close()
+        except Exception:
+            pass
+
+    saved = _read_json(os.path.join(gui_dir, f"gui_{GUI_NUM}.json"))
+    traj = saved["messages"][1]["trajectory"]
+    first = traj[0]
+
+    # 受保护字段原样保留
+    assert first["CoT"] == "下游已填的思维链"
+    assert first["observation"]["active_window"] == "设置主页"
+    assert first["observation"]["ui_tree_segment"] == {"nodes": ["a", "b"]}
+    assert first["actions"][0]["element"] == "设置图标"
+    assert first["actions"][0]["status"] == "success"
+    # 未知键（步骤层 / observation 层 / action 层）保留
+    assert first["unknown_step_key"] == "保留我"
+    assert first["observation"]["unknown_obs_key"] == 42
+    assert first["actions"][0]["unknown_action_key"] == ["x", "y"]
+    # 被编辑字段是新值
+    assert first["intent"] == "打开设置-改"
+    assert first["actions"][0]["coordinate"] == [111, 222]
+    # 未编辑步骤逐字段不变
+    assert traj[1] == data["messages"][1]["trajectory"][1]
+    # 入参 data 未被原地改写
+    assert data == original_snapshot
+
+
+# ----------------------------------------------------------------------
+# 10. 草稿路径：平铺键 / observation dict 两种承载的对称往返；无可选键时
+#     磁盘结构与旧格式逐字一致
+# ----------------------------------------------------------------------
+
+def _draft_payload(steps_data, current_step_index=0):
+    return {
+        "gui_number": GUI_NUM,
+        "app_name": f"gui_{GUI_NUM}",
+        "task_instruction": "草稿指令",
+        "screen_info": {"platform": "Android", "system": "Android 13",
+                        "screen_size": [360, 640]},
+        "app_type": "",
+        "rounds": [],
+        "steps_data": steps_data,
+        "current_step_index": current_step_index,
+        "updated_at": "2026-11-11T10:00:00",
+    }
+
+
+def _new_draft_editor(base_dir):
+    dm = DataManager(base_dir=str(base_dir))
+    dm.create_task_directory("Android")
+    editor = AnnotationEditor(
+        data_manager=dm,
+        app_name=f"gui_{GUI_NUM}",
+        task_instruction="",
+        screen_info={"platform": "Android", "system": "Android 13",
+                     "screen_size": [360, 640]},
+        app_type="",
+        serial=None,
+        init_window=None,
+    )
+    editor.screen_capture = FakeAndroidScreenCapture()
+    return editor
+
+
+def test_draft_optional_keys_round_trip_flat_and_observation(tmp_path, qapp, modal):
+    gui_dir = os.path.join(str(tmp_path), f"gui_{GUI_NUM}")
+    os.makedirs(gui_dir, exist_ok=True)
+    for i in range(1, 3):
+        _write_png(os.path.join(gui_dir, f"gui_{GUI_NUM}_{i:04d}.png"), i)
+
+    flat_step = {
+        "screenshot": f"gui_{GUI_NUM}_0001.png",
+        "intent": "平铺承载步",
+        "action_data": {"action": "click", "coordinate": [1, 2],
+                        "element": "图标", "status": "success"},
+        "vertices": [0, 0, 10, 10],
+        "CoT": "平铺 CoT",
+        "active_window": "平铺窗口",
+        "ui_tree_segment": {"nodes": ["flat"]},
+    }
+    obs_step = {
+        "screenshot": f"gui_{GUI_NUM}_0002.png",
+        "intent": "observation 承载步",
+        "action_data": {"action": "terminate", "element": "",
+                        "status": "success"},
+        "vertices": None,
+        "observation": {
+            "active_window": "dict 窗口",
+            "ui_tree_segment": {"nodes": ["obs"]},
+        },
+    }
+    draft = _draft_payload([flat_step, obs_step], current_step_index=1)
+    draft_path = os.path.join(gui_dir, f"gui_{GUI_NUM}_draft.json")
+    with open(draft_path, "w", encoding="utf-8") as f:
+        json.dump(draft, f, ensure_ascii=False, indent=2)
+
+    # 编辑器 A：续采恢复，验证 load_from_draft 对称恢复两种承载
+    editor_a = _new_draft_editor(tmp_path)
+    try:
+        loaded = editor_a.data_manager.load_draft(GUI_NUM)
+        assert loaded is not None
+        assert editor_a.load_from_draft(loaded) is False
+        flush_events(20)
+
+        restored = editor_a.steps_data
+        # 对称恢复：平铺三字段与 observation dict 都在
+        assert restored[0]["CoT"] == "平铺 CoT"
+        assert restored[0]["active_window"] == "平铺窗口"
+        assert restored[0]["ui_tree_segment"] == {"nodes": ["flat"]}
+        assert restored[1]["observation"] == {
+            "active_window": "dict 窗口",
+            "ui_tree_segment": {"nodes": ["obs"]},
+        }
+        # 运行态绝对路径已重建
+        assert restored[0]["screenshot_filepath"] == os.path.join(
+            gui_dir, f"gui_{GUI_NUM}_0001.png")
+        assert "screenshot_filepath" not in flat_step
+
+        # 冻结表单→steps_data 同步（本用例只验序列化层对称，不验表单），
+        # 让 _write_draft_now 按恢复出来的完整 steps_data 原样再写盘；
+        # 先停防抖定时器，避免排队的草稿保存随后用空表单覆盖本次结果
+        editor_a._save_current_to_steps = lambda: None
+        editor_a._edit_mode = False
+        editor_a.draft_timer.stop()
+        editor_a._write_draft_now()
+        flush_events()
+
+        # 断言放在 close() 之前：关闭窗口会触发草稿清理，与序列化对称性无关
+        redrafted = _read_json(draft_path)
+        redrafted_steps = redrafted["steps_data"]
+        assert redrafted_steps[0]["CoT"] == "平铺 CoT"
+        assert redrafted_steps[0]["active_window"] == "平铺窗口"
+        assert redrafted_steps[0]["ui_tree_segment"] == {"nodes": ["flat"]}
+        assert redrafted_steps[1]["observation"] == {
+            "active_window": "dict 窗口",
+            "ui_tree_segment": {"nodes": ["obs"]},
+        }
+        # 绝不含运行态绝对路径
+        for step in redrafted_steps:
+            assert "screenshot_filepath" not in step
+
+        # 编辑器 B：对再写盘的草稿二次续采，字段仍不丢
+        editor_b = _new_draft_editor(tmp_path)
+        try:
+            reloaded = editor_b.data_manager.load_draft(GUI_NUM)
+            assert reloaded is not None
+            assert editor_b.load_from_draft(reloaded) is False
+            flush_events(20)
+            again = editor_b.steps_data
+            assert again[0]["CoT"] == "平铺 CoT"
+            assert again[0]["active_window"] == "平铺窗口"
+            assert again[0]["ui_tree_segment"] == {"nodes": ["flat"]}
+            assert again[1]["observation"] == {
+                "active_window": "dict 窗口",
+                "ui_tree_segment": {"nodes": ["obs"]},
+            }
+        finally:
+            try:
+                editor_b.close()
+            except Exception:
+                pass
+    finally:
+        try:
+            editor_a.close()
+        except Exception:
+            pass
+
+
+def test_draft_without_optional_keys_keeps_legacy_shape(tmp_path, qapp, modal):
+    gui_dir = os.path.join(str(tmp_path), f"gui_{GUI_NUM}")
+    os.makedirs(gui_dir, exist_ok=True)
+    _write_png(os.path.join(gui_dir, f"gui_{GUI_NUM}_0001.png"), 1)
+
+    legacy_step = {
+        "screenshot": f"gui_{GUI_NUM}_0001.png",
+        "intent": "旧格式步",
+        "action_data": {"action": "click", "coordinate": [1, 2]},
+        "vertices": None,
+    }
+    draft = _draft_payload([legacy_step])
+    draft_path = os.path.join(gui_dir, f"gui_{GUI_NUM}_draft.json")
+    with open(draft_path, "w", encoding="utf-8") as f:
+        json.dump(draft, f, ensure_ascii=False, indent=2)
+
+    editor = _new_draft_editor(tmp_path)
+    try:
+        loaded = editor.data_manager.load_draft(GUI_NUM)
+        assert loaded is not None
+        assert editor.load_from_draft(loaded) is False
+        flush_events(20)
+
+        # 恢复后仍是旧四键结构（加运行态 filepath 共五键），不凭空补可选键
+        restored = editor.steps_data[0]
+        assert set(restored.keys()) == {
+            "screenshot", "screenshot_filepath", "intent",
+            "action_data", "vertices"}
+
+        # 冻结表单同步，按恢复现场原样再写盘；先停防抖定时器，避免排队的
+        # 草稿保存随后用空表单覆盖本次序列化结果
+        editor._save_current_to_steps = lambda: None
+        editor._edit_mode = False
+        editor.draft_timer.stop()
+        editor._write_draft_now()
+        flush_events()
+
+        # 断言放在 close() 之前：关闭窗口会触发草稿清理，与序列化对称性无关
+        redrafted = _read_json(draft_path)
+        # 磁盘上的步骤条目与旧格式逐字一致
+        assert redrafted["steps_data"] == [legacy_step]
+        for step in redrafted["steps_data"]:
+            assert "CoT" not in step
+            assert "active_window" not in step
+            assert "ui_tree_segment" not in step
+            assert "observation" not in step
+    finally:
+        try:
+            editor.close()
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------
+# 11. 落轮透传：_save_current_round_to_list 的 .get 三字段透传
+# ----------------------------------------------------------------------
+
+def test_save_current_round_to_list_passes_optional_fields_through(tmp_path, qapp, modal):
+    gui_dir = os.path.join(str(tmp_path), f"gui_{GUI_NUM}")
+    os.makedirs(gui_dir, exist_ok=True)
+    for i in range(1, 3):
+        _write_png(os.path.join(gui_dir, f"gui_{GUI_NUM}_{i:04d}.png"), i)
+
+    editor = _new_draft_editor(tmp_path)
+    try:
+        editor.task_instruction = "落轮指令"
+        editor.rounds = []
+        editor.steps_data = [
+            {
+                "screenshot": f"gui_{GUI_NUM}_0001.png",
+                "screenshot_filepath": os.path.join(
+                    gui_dir, f"gui_{GUI_NUM}_0001.png"),
+                "intent": "平铺透传步",
+                "action_data": {"action": "click", "coordinate": [1, 2],
+                                "element": "图标", "status": "success"},
+                "vertices": [0, 0, 10, 10],
+                "CoT": "落轮思维链",
+                "active_window": "平铺窗口",
+                "ui_tree_segment": {"nodes": ["t"]},
+            },
+            {
+                "screenshot": f"gui_{GUI_NUM}_0002.png",
+                "screenshot_filepath": os.path.join(
+                    gui_dir, f"gui_{GUI_NUM}_0002.png"),
+                "intent": "observation 承载步",
+                "action_data": {"action": "terminate", "element": "",
+                                "status": "success"},
+                "vertices": None,
+                "observation": {
+                    "active_window": "dict 窗口",
+                    "ui_tree_segment": {"nodes": ["o"]},
+                },
+            },
+        ]
+        editor._current_round_saved = False
+        # 落轮尾部会写草稿，属正常路径
+        assert editor._save_current_round_to_list(False) is True
+
+        assert len(editor.rounds) == 1
+        traj = editor.rounds[0]["trajectory"]
+        assert traj[0]["CoT"] == "落轮思维链"
+        assert traj[0]["observation"]["active_window"] == "平铺窗口"
+        assert traj[0]["observation"]["ui_tree_segment"] == {"nodes": ["t"]}
+        assert traj[1]["CoT"] == ""
+        assert traj[1]["observation"]["active_window"] == "dict 窗口"
+        assert traj[1]["observation"]["ui_tree_segment"] == {"nodes": ["o"]}
+        for entry in traj:
+            assert set(entry.keys()) == {"step", "intent", "CoT",
+                                         "observation", "actions"}
+            assert set(entry["observation"].keys()) == {
+                "screenshot", "active_window", "ui_tree_segment"}
+        assert editor.steps_data == []
+    finally:
+        try:
+            editor.close()
+        except Exception:
+            pass
+
+
+def test_save_current_round_to_list_defaults_to_empty_strings(tmp_path, qapp, modal):
+    gui_dir = os.path.join(str(tmp_path), f"gui_{GUI_NUM}")
+    os.makedirs(gui_dir, exist_ok=True)
+    _write_png(os.path.join(gui_dir, f"gui_{GUI_NUM}_0001.png"), 1)
+
+    editor = _new_draft_editor(tmp_path)
+    try:
+        editor.task_instruction = "无透传字段指令"
+        editor.rounds = []
+        editor.steps_data = [
+            {
+                "screenshot": f"gui_{GUI_NUM}_0001.png",
+                "screenshot_filepath": os.path.join(
+                    gui_dir, f"gui_{GUI_NUM}_0001.png"),
+                "intent": "裸步",
+                "action_data": {"action": "click", "coordinate": [1, 2]},
+                "vertices": None,
+            },
+        ]
+        editor._current_round_saved = False
+        assert editor._save_current_round_to_list(False) is True
+
+        entry = editor.rounds[0]["trajectory"][0]
+        assert entry["CoT"] == ""
+        assert entry["observation"]["active_window"] == ""
+        assert entry["observation"]["ui_tree_segment"] == ""
+        assert set(entry.keys()) == {"step", "intent", "CoT",
+                                     "observation", "actions"}
+    finally:
+        try:
+            editor.close()
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------
+# 12. 终止类专项：terminate / answer 编辑保存后 element==""、status=="success"，
+#     步骤级三字段仍保留
+# ----------------------------------------------------------------------
+
+def _build_terminate_dataset(base_dir):
+    gui_dir = os.path.join(str(base_dir), f"gui_{GUI_NUM}")
+    os.makedirs(gui_dir, exist_ok=True)
+
+    names = [f"gui_{GUI_NUM}_{i:04d}.png" for i in range(1, 3)]
+    for i, name in enumerate(names, start=1):
+        _write_png(os.path.join(gui_dir, name), i)
+
+    trajectory = [
+        {
+            "step": 0,
+            "intent": "任务收尾",
+            "CoT": "终止步思维链",
+            "observation": {
+                "screenshot": names[0],
+                "active_window": "终态窗口",
+                "ui_tree_segment": {"nodes": ["term"]},
+            },
+            "actions": [
+                {"action": "terminate", "element": "", "status": "success"}
+            ],
+        },
+        {
+            "step": 1,
+            "intent": "回答问题",
+            "CoT": "回答步思维链",
+            "observation": {
+                "screenshot": names[1],
+                "active_window": "问答窗口",
+                "ui_tree_segment": {"nodes": ["ans"]},
+            },
+            "actions": [
+                {"action": "answer", "text": "最终答案", "element": "",
+                 "status": "success"}
+            ],
+        },
+    ]
+    data = {
+        "platform": "Android",
+        "system": "Android 13",
+        "screen_size": [360, 640],
+        "task_type": "Android-社交",
+        "messages": [
+            {"role": "user", "instruction": "终止类轮次"},
+            {"role": "assistant", "trajectory": trajectory},
+        ],
+    }
+    coords_entries = [
+        {"step": 0, "action": "terminate"},
+        {"step": 1, "action": "answer", "center": [0, 0]},
+    ]
+    with open(os.path.join(gui_dir, f"gui_{GUI_NUM}.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(gui_dir, f"gui_{GUI_NUM}_coords.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"version": "3.0", "coords": coords_entries}, f,
+                  ensure_ascii=False, indent=2)
+    return gui_dir, data, coords_entries
+
+
+def test_terminate_and_answer_keep_empty_element_success_status(tmp_path, qapp, modal):
+    gui_dir, data, coords_entries = _build_terminate_dataset(tmp_path)
+    editor = _load_editor(tmp_path, gui_dir, data, coords_entries, round_index=0)
+    try:
+        # 首步 terminate：仅改意图后确认，动作仍为 terminate
+        assert editor.action_combo.currentData() == "terminate"
+        editor.intent_input.setText("任务收尾-改")
+        editor.confirm_step()
+        flush_events()
+
+        # 第二步 answer：改回答文本
+        editor.jump_to_step(1)
+        flush_events()
+        assert editor.action_combo.currentData() == "answer"
+        editor.text_input.setText("更新后的答案")
+        editor.confirm_step()
+        flush_events()
+
+        assert editor.save_edited_round(False) is True
+        flush_events(50)
+    finally:
+        editor._edit_final_saved = True
+        try:
+            editor.close()
+        except Exception:
+            pass
+
+    traj = _read_json(os.path.join(gui_dir, f"gui_{GUI_NUM}.json"))[
+        "messages"][1]["trajectory"]
+    term_action = traj[0]["actions"][0]
+    ans_action = traj[1]["actions"][0]
+    assert term_action["action"] == "terminate"
+    assert term_action["element"] == ""
+    assert term_action["status"] == "success"
+    assert ans_action["action"] == "answer"
+    assert ans_action["element"] == ""
+    assert ans_action["status"] == "success"
+    assert ans_action["text"] == "更新后的答案"
+    # 步骤级三字段仍保留
+    assert traj[0]["CoT"] == "终止步思维链"
+    assert traj[0]["observation"]["active_window"] == "终态窗口"
+    assert traj[0]["observation"]["ui_tree_segment"] == {"nodes": ["term"]}
+    assert traj[1]["CoT"] == "回答步思维链"
+    assert traj[1]["observation"]["active_window"] == "问答窗口"
+    assert traj[1]["observation"]["ui_tree_segment"] == {"nodes": ["ans"]}
+
+
+# ----------------------------------------------------------------------
+# 13. _merge_missing_keys 直接单测：空值回退 / 非空覆盖 / 非原地 /
+#     深拷贝隔离 / actions 超长下标保留
+# ----------------------------------------------------------------------
+
+def _bare_editor():
+    """绕过 QWidget 初始化的裸实例，仅用于不依赖 UI 状态的纯数据方法。"""
+    return AnnotationEditor.__new__(AnnotationEditor)
+
+
+def test_merge_protected_empty_values_fall_back_to_original():
+    editor = _bare_editor()
+    old = {
+        "CoT": "原 CoT",
+        "observation": {
+            "active_window": "原窗口",
+            "ui_tree_segment": {"nodes": [1]},
+        },
+        "actions": [
+            {"element": "原元素", "status": "原状态", "action": "click"},
+        ],
+    }
+    new = {
+        "CoT": "",
+        "observation": {
+            "active_window": None,
+            "ui_tree_segment": {},
+        },
+        "actions": [
+            {"element": "", "status": "", "action": "click"},
+        ],
+    }
+    merged = editor._merge_missing_keys(
+        new, old, AnnotationEditor._PROTECTED_STEP_KEYS)
+
+    assert merged["CoT"] == "原 CoT"
+    assert merged["observation"]["active_window"] == "原窗口"
+    assert merged["observation"]["ui_tree_segment"] == {"nodes": [1]}
+    assert merged["actions"][0]["element"] == "原元素"
+    assert merged["actions"][0]["status"] == "原状态"
+
+
+def test_merge_protected_non_empty_values_override():
+    editor = _bare_editor()
+    old = {
+        "CoT": "原 CoT",
+        "observation": {
+            "active_window": "原窗口",
+            "ui_tree_segment": {"nodes": [1]},
+        },
+        "actions": [
+            {"element": "原元素", "status": "原状态",
+             "action": "click", "coordinate": [1, 1]},
+        ],
+    }
+    new = {
+        "CoT": "新 CoT",
+        "observation": {
+            "active_window": "新窗口",
+            "ui_tree_segment": {"nodes": [2]},
+        },
+        "actions": [
+            {"element": "新元素", "status": "新状态",
+             "action": "click", "coordinate": [2, 2]},
+        ],
+    }
+    merged = editor._merge_missing_keys(
+        new, old, AnnotationEditor._PROTECTED_STEP_KEYS)
+
+    assert merged["CoT"] == "新 CoT"
+    assert merged["observation"]["active_window"] == "新窗口"
+    assert merged["observation"]["ui_tree_segment"] == {"nodes": [2]}
+    assert merged["actions"][0]["element"] == "新元素"
+    assert merged["actions"][0]["status"] == "新状态"
+    assert merged["actions"][0]["coordinate"] == [2, 2]
+
+
+def test_merge_does_not_mutate_inputs_and_deep_copies():
+    editor = _bare_editor()
+    old = {
+        "CoT": "原 CoT",
+        "unknown": {"nested": [1, 2]},
+        "observation": {"active_window": "原窗口",
+                        "ui_tree_segment": {"nodes": [1]}},
+        "actions": [
+            {"element": "原元素", "status": "s", "action": "click",
+             "extra": {"k": ["v"]}},
+            {"element": "超长下标元素", "status": "s2", "action": "scroll"},
+        ],
+    }
+    old_snapshot = copy.deepcopy(old)
+    new = {
+        "CoT": "",
+        "observation": {"active_window": "", "ui_tree_segment": ""},
+        "actions": [
+            {"element": "", "status": "", "action": "click"},
+        ],
+    }
+    new_snapshot = copy.deepcopy(new)
+
+    merged = editor._merge_missing_keys(
+        new, old, AnnotationEditor._PROTECTED_STEP_KEYS)
+
+    # 入参原样不动
+    assert old == old_snapshot
+    assert new == new_snapshot
+
+    # old 有 new 无的键深拷贝保留
+    assert merged["unknown"] == {"nested": [1, 2]}
+    # actions 超长下标元素深拷贝保留
+    assert len(merged["actions"]) == 2
+    assert merged["actions"][1] == {
+        "element": "超长下标元素", "status": "s2", "action": "scroll"}
+
+    # 深拷贝隔离：改 merged 不回写 old/new
+    merged["unknown"]["nested"].append(3)
+    merged["observation"]["ui_tree_segment"]["nodes"].append(9)
+    merged["actions"][0]["extra"]["k"].append("mutated")
+    merged["actions"][1]["element"] = "被改了"
+    assert old["unknown"] == {"nested": [1, 2]}
+    assert old["observation"]["ui_tree_segment"] == {"nodes": [1]}
+    assert old["actions"][0]["extra"] == {"k": ["v"]}
+    assert old["actions"][1]["element"] == "超长下标元素"
+    assert new == new_snapshot
+
+
+def test_merge_non_dict_falls_back_to_new_value():
+    editor = _bare_editor()
+    # 标量场景：以新值为准（深拷贝）
+    assert editor._merge_missing_keys("新", "旧") == "新"
+    assert editor._merge_missing_keys(None, "旧") is None
+    # 空 list / 空 dict 的受保护空值判定
+    assert AnnotationEditor._is_empty_protected_value(None) is True
+    assert AnnotationEditor._is_empty_protected_value("") is True
+    assert AnnotationEditor._is_empty_protected_value({}) is True
+    assert AnnotationEditor._is_empty_protected_value([]) is True
+    assert AnnotationEditor._is_empty_protected_value(0) is False
+    assert AnnotationEditor._is_empty_protected_value("x") is False
+    assert AnnotationEditor._is_empty_protected_value({"a": 1}) is False

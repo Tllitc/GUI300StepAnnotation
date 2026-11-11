@@ -240,3 +240,200 @@ def test_missing_intent_blocks_save(editor, monkeypatch):
 
     assert H.read_final_json(editor) == original
     assert len(editor.steps) == 2
+
+
+# ---------------------------------------------------------------------------
+# 回归：编辑已完成任务 / 草稿续采时，编辑器不采集的下游字段不被空值覆盖
+#
+# 缺陷背景：这两条路径都会用 StepEditorWidget.get_data() 重建步骤字典——
+# ui_tree_segment 没有表单控件、非终止动作的 status 根本不在重建结果里、
+# 下游标注附加的未知键更不会被重建。旧实现用新字典整体覆盖原步骤，导致
+# 打开并保存一次就把这些字段静默清空。修复后由 _merge_step_with_original
+# 做字段级合并，下面三条用例分别从「编辑已完成」「终止动作业务规则」
+# 「草稿续采实时重建」三个入口做端到端回归。
+# ---------------------------------------------------------------------------
+def _regression_single_round(gui_number, action_data, instruction="回归单轮指令"):
+    """构造 1 轮最终 JSON 的单步轨迹（macOS 测试不需要真实 PNG 文件）。"""
+    shot = f"gui_{gui_number}_0001.png"
+    return {
+        "platform": "Windows 11",
+        "system": "Windows 11",
+        "screen_size": [1920, 1080],
+        "task_type": "Windows-测试",
+        "messages": [
+            {"role": "user", "instruction": instruction},
+            {"role": "assistant", "trajectory": [{
+                "step": 0,
+                "intent": "步骤0",
+                "CoT": "",
+                "observation": {
+                    "screenshot": shot,
+                    "active_window": "测试App",
+                    "ui_tree_segment": "",
+                },
+                "actions": [action_data],
+            }]},
+        ],
+    }
+
+
+def _assert_downstream_fields_preserved(step, cot, window, ui_tree):
+    """受保护下游字段逐字等于原值（CoT / active_window / ui_tree_segment）。"""
+    assert step["CoT"] == cot
+    assert step["observation"]["active_window"] == window
+    assert step["observation"]["ui_tree_segment"] == ui_tree
+
+
+def test_edit_completed_intent_only_change_keeps_protected_and_unknown_keys(editor):
+    """用例 A：编辑已完成任务只改 intent，下游受保护字段与三层未知键原样保留。
+
+    三个层级的未知键（步骤级 / observation / actions[0]）都不在编辑器重建
+    结果里，必须由合并逻辑从原步骤补齐；受保护字段则要逐字等于原值，
+    而不是被重建字典的空值或表单回填值覆盖。
+    """
+    gui = editor.gui_number
+    data = _regression_single_round(gui, {
+        "action": "left_click",
+        "coordinate": [200, 300],
+        "element": "",
+        "status": "success",
+    })
+    original_step = data["messages"][1]["trajectory"][0]
+    original_step["CoT"] = "下游CoT"
+    original_step["observation"]["active_window"] = "下游窗口"
+    original_step["observation"]["ui_tree_segment"] = "下游UI树片段"
+    original_step["actions"][0]["element"] = "下游元素"
+    original_step["actions"][0]["status"] = "success"
+    original_step["extra_step_key"] = {"a": 1}
+    original_step["observation"]["extra_obs_key"] = "keep"
+    original_step["actions"][0]["extra_action_key"] = [1, 2]
+    expected_step = copy.deepcopy(original_step)
+
+    coords = [{"step": 0, "action": "left_click",
+               "vertices": [100, 200, 300, 400], "center": [200, 300]}]
+    gui_dir = _write_dataset(editor, data, coords)
+    assert editor.load_from_completed_json(data, coords, 0, gui_dir) is True
+    QTest.qWait(50)
+
+    editor.steps[0]["editor"].intent_input.setText("只改意图")
+    assert editor.save_edited_round(silent=True) is True
+
+    saved_step = H.read_final_json(editor)["messages"][1]["trajectory"][0]
+    assert saved_step["intent"] == "只改意图"
+    _assert_downstream_fields_preserved(
+        saved_step, "下游CoT", "下游窗口", "下游UI树片段")
+    assert saved_step["actions"][0]["element"] == "下游元素"
+    assert saved_step["actions"][0]["status"] == "success"
+    assert saved_step["extra_step_key"] == {"a": 1}
+    assert saved_step["observation"]["extra_obs_key"] == "keep"
+    assert saved_step["actions"][0]["extra_action_key"] == [1, 2]
+    # 逐字段对照原步骤：三层未知键的值与类型都不被改写
+    assert saved_step["extra_step_key"] == expected_step["extra_step_key"]
+    assert saved_step["observation"]["extra_obs_key"] \
+        == expected_step["observation"]["extra_obs_key"]
+    assert saved_step["actions"][0]["extra_action_key"] \
+        == expected_step["actions"][0]["extra_action_key"]
+
+
+def test_edit_completed_terminal_step_forces_element_and_status(editor):
+    """用例 B：终止类动作保存后 element 强制为空、status 强制 success。
+
+    终止动作不采集元素（历史残留的 element 必须清掉），失败状态也不能带进
+    已完成任务交付件；同时 CoT/active_window/ui_tree_segment 仍按保留规则
+    沿用原值，不能被终止规则连带清空。
+    """
+    gui = editor.gui_number
+    data = _regression_single_round(gui, {
+        "action": "terminate",
+        "element": "残留元素",
+        "status": "failed",
+    })
+    terminal_step = data["messages"][1]["trajectory"][0]
+    terminal_step["CoT"] = "终止步CoT"
+    terminal_step["observation"]["active_window"] = "终止步窗口"
+    terminal_step["observation"]["ui_tree_segment"] = "终止步UI树片段"
+
+    # terminate 无坐标，coords 给空数组即可
+    gui_dir = _write_dataset(editor, data, [])
+    assert editor.load_from_completed_json(data, [], 0, gui_dir) is True
+    QTest.qWait(50)
+    assert len(editor.steps) == 1
+
+    assert editor.save_edited_round(silent=True) is True
+
+    saved_step = H.read_final_json(editor)["messages"][1]["trajectory"][0]
+    assert saved_step["actions"][0]["action"] == "terminate"
+    assert saved_step["actions"][0]["element"] == ""
+    assert saved_step["actions"][0]["status"] == "success"
+    _assert_downstream_fields_preserved(
+        saved_step, "终止步CoT", "终止步窗口", "终止步UI树片段")
+
+
+def test_draft_resume_save_current_step_keeps_protected_fields(editor):
+    """用例 C：草稿续采——save_current_step 与 _write_draft_now 两次重建步骤
+    字典都不得清空草稿里的 CoT/active_window/ui_tree_segment。
+
+    草稿的 current_steps[].data 是下游字段的唯一载体：确认保存后内存快照要
+    保留，_write_draft_now 落盘后的草稿也要保留，否则续采一次就永久丢字段。
+    """
+    gui = editor.gui_number
+    shot = f"gui_{gui}_0001.png"
+
+    draft = {
+        "gui_number": gui,
+        "app_name": editor.app_name,
+        "task_instruction": "续采指令",
+        "screen_info": editor.screen_info,
+        "app_type": editor.app_type,
+        "rounds": [],
+        "current_steps": [{
+            "screenshot_filename": shot,
+            "rect_info": [100, 200, 200, 200],
+            "selection_type": None,
+            "data": {
+                "step": 0,
+                "intent": "草稿原始意图",
+                "CoT": "草稿CoT",
+                "observation": {
+                    "screenshot": shot,
+                    "active_window": "草稿窗口",
+                    "ui_tree_segment": "草稿UI树片段",
+                },
+                "actions": [{
+                    "action": "left_click",
+                    "coordinate": [200, 300],
+                    "element": "草稿元素",
+                    "status": "success",
+                }],
+            },
+        }],
+        "coords_entries": [],
+        "updated_at": "2026-01-01T00:00:00",
+    }
+    assert editor.data_manager.save_draft(draft, gui)
+    restored = editor.data_manager.load_draft(gui)
+    assert restored is not None
+
+    editor.load_from_draft(restored)
+    QTest.qWait(100)
+    assert len(editor.steps) == 1
+
+    editor.steps[0]["editor"].intent_input.setText("续采后的新意图")
+    H.save_current(editor)
+
+    # 内存快照：结构为 {..., "data": {...}}
+    saved_step = editor.steps[0]["data"]
+    assert saved_step["intent"] == "续采后的新意图"
+    _assert_downstream_fields_preserved(
+        saved_step, "草稿CoT", "草稿窗口", "草稿UI树片段")
+
+    editor._write_draft_now()
+    QTest.qWait(50)
+
+    disk_step = H.read_draft(editor)["current_steps"][0]["data"]
+    assert disk_step["intent"] == "续采后的新意图"
+    _assert_downstream_fields_preserved(
+        disk_step, "草稿CoT", "草稿窗口", "草稿UI树片段")
+    # 落草稿后内存快照同样保留
+    _assert_downstream_fields_preserved(
+        editor.steps[0]["data"], "草稿CoT", "草稿窗口", "草稿UI树片段")
