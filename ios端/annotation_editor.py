@@ -243,7 +243,7 @@ class ScreenshotCanvas(QFrame):
         if self.pixmap is None:
             painter.setPen(QColor(120, 120, 120))
             painter.setFont(QFont("Microsoft YaHei", 14))
-            painter.drawText(self.rect(), Qt.AlignCenter, '点击 [截图(Ctrl+Q)] 按钮获取iPhone截图')
+            painter.drawText(self.rect(), Qt.AlignCenter, '点击 [给下一步截图(Ctrl+Q)] 按钮获取iPhone截图')
 
     def _canvas_to_original(self, canvas_rect):
         """将画布坐标矩形变换回原始图片坐标"""
@@ -836,6 +836,9 @@ class AnnotationEditor(QMainWindow):
         # “在当前步之后插入”截图锚点（None 表示普通追加；整数表示锚点步下标）
         self._capture_insert_after = None
 
+        # 「给下一步截图」：从已落表步骤追加新步骤空位（True 时跳过原地覆盖判定）
+        self._capture_append_new_step = False
+
         # 截图进行中标记（防止重复触发）
         self._screenshot_in_progress = False
 
@@ -943,6 +946,14 @@ class AnnotationEditor(QMainWindow):
         self.btn_insert.clicked.connect(self.start_insert_capture)
         toolbar.addWidget(self.btn_insert)
 
+        # 原地覆盖当前步截图（不新增步骤，序号不变）
+        self.btn_recapture = QPushButton("重新截图")
+        self.btn_recapture.setStyleSheet(
+            "QPushButton { background-color: #FF9800; color: white; padding: 6px 12px; font-weight: bold; }"
+        )
+        self.btn_recapture.clicked.connect(self.recapture_current_step)
+        toolbar.addWidget(self.btn_recapture)
+
         # 编辑已完成任务时可见：不重新截图，直接在磁盘原图上重新拖框
         self.btn_relabel = QPushButton("在原图上重新拉框")
         self.btn_relabel.setStyleSheet(
@@ -952,12 +963,12 @@ class AnnotationEditor(QMainWindow):
         self.btn_relabel.hide()
         toolbar.addWidget(self.btn_relabel)
 
-        self.btn_screenshot = QPushButton("截图 (Ctrl+Q)")
-        self.btn_screenshot.setStyleSheet(
+        self.btn_capture_next = QPushButton("给下一步截图 (Ctrl+Q)")
+        self.btn_capture_next.setStyleSheet(
             "QPushButton { background-color: #2196F3; color: white; padding: 6px 16px; font-weight: bold; }"
         )
-        self.btn_screenshot.clicked.connect(self.take_screenshot)
-        toolbar.addWidget(self.btn_screenshot)
+        self.btn_capture_next.clicked.connect(self.start_capture)
+        toolbar.addWidget(self.btn_capture_next)
 
         self.btn_confirm = QPushButton("确认 (Ctrl+S)")
         self.btn_confirm.setStyleSheet(
@@ -1191,7 +1202,7 @@ class AnnotationEditor(QMainWindow):
         main_layout.addWidget(outer_splitter, 1)
 
         # === 状态栏 ===
-        self.status_label = QLabel('就绪 - 请点击 [截图(Ctrl+Q)] 按钮开始')
+        self.status_label = QLabel('就绪 - 请点击 [给下一步截图(Ctrl+Q)] 按钮开始')
         self.status_label.setStyleSheet("padding: 5px; background-color: #f0f0f0;")
         main_layout.addWidget(self.status_label)
 
@@ -1319,6 +1330,75 @@ class AnnotationEditor(QMainWindow):
         )
         self.take_screenshot()
 
+    def start_capture(self):
+        """给下一步截图：追加一个新步骤的截图（绝不覆盖当前步截图）"""
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
+        if self._screenshot_in_progress:
+            return  # 上一次截图尚未完成，忽略重复触发
+        if self.gui_dir is None:
+            QMessageBox.warning(self, "提示", "请先初始化任务目录")
+            return
+        # swipe/drag 测量是「起点框 -> 终点框」两阶段流程，此时追加新步会
+        # 破坏当前测量上下文并产生孤儿截图，入口直接拦截
+        if self._swipe_measuring:
+            QMessageBox.warning(self, "提示", "滑动/拖拽测量进行中，请先完成或取消测量后再截图")
+            return
+        if self._scroll_measuring:
+            QMessageBox.warning(
+                self, "提示",
+                "滚动测量进行中，请使用[重新截图]获取参照物截图，或先完成测量",
+            )
+            return
+        # 防御性清除残留：追加模式不得叠加插入锚点或原地覆盖标记
+        self._capture_insert_after = None
+        self._replacing_screenshot = False
+        if self.current_step < len(self.steps_data):
+            # 当前停在已落表步骤：新截图将成为下一个步骤
+            self._capture_append_new_step = True
+            self.status_label.setText("正在为下一步从 iPhone 截图...")
+        else:
+            # 已处于待确认空位，它本身就是「下一步」：走默认语义，
+            # 已有待确认图则原地覆盖，避免产生无主的孤儿文件
+            self.status_label.setText("正在从 iPhone 截图...")
+        self.take_screenshot()
+
+    def recapture_current_step(self):
+        """重新截图：原地覆盖当前步骤的截图（无可用截图时退化为首次截图）"""
+        if self._round_transition_pending:
+            self.status_label.setText("轮次切换中，请稍候...")
+            return
+        if self._screenshot_in_progress:
+            return  # 上一次截图尚未完成，忽略重复触发
+        if self.gui_dir is None:
+            QMessageBox.warning(self, "提示", "请先初始化任务目录")
+            return
+        if self._swipe_measuring:
+            QMessageBox.warning(
+                self, "提示", "滑动/拖拽测量进行中，请先完成或取消测量后再重新截图"
+            )
+            return
+        # 重新截图语义固定为原地覆盖，不得走插入/追加
+        self._capture_insert_after = None
+        self._capture_append_new_step = False
+        self._replacing_screenshot = False
+
+        has_capture = bool(self._current_screenshot_filename) or (
+            self._screenshot_missing
+            and 0 <= self.current_step < len(self.steps_data)
+            and self.steps_data[self.current_step].get("screenshot")
+        )
+        if not has_capture:
+            # 空位/首次截图：交给默认语义决定追加还是覆盖
+            self.status_label.setText("正在从 iPhone 截图...")
+            self.take_screenshot()
+            return
+        # scroll 测量期间不拦截：必须继续走 extra 截图路径
+        # （由 _scroll_preserve_screenshot 分支处理，避免覆盖步骤截图）
+        self.status_label.setText("正在重新截取当前步骤截图...")
+        self.take_screenshot()
+
     def take_screenshot(self):
         """截取 iOS 屏幕（如同一步骤已有截图则替换）"""
         if self._round_transition_pending:
@@ -1333,6 +1413,9 @@ class AnnotationEditor(QMainWindow):
 
         # 插入模式：即将生成新序号文件，不能覆盖锚点步截图
         if self._capture_insert_after is not None:
+            pass
+        # 给下一步截图：强制走追加分支，不能把当前步判定为「原地覆盖」
+        elif self._capture_append_new_step:
             pass
         # scroll 测量期间不删除旧截图，保留第一张作为步骤截图
         elif not self._scroll_preserve_screenshot:
@@ -1486,12 +1569,46 @@ class AnnotationEditor(QMainWindow):
                         self.schedule_draft_save()
                         self.status_label.setText("截图完成 - 请在图片上拉框标注目标区域，然后填写动作信息")
                     else:
+                        # 从已落表步骤追加新步：当前游标还在旧步，必须先把旧步
+                        # 现场落表（此时 _current_screenshot_filename 仍指向旧步
+                        # 截图），再切换截图状态，否则旧步编辑内容丢失
+                        appended_from_step = (
+                            self._capture_append_new_step
+                            and self.current_step < len(self.steps_data)
+                        )
+                        if appended_from_step:
+                            # 编辑已完成任务时截图可能缺失，走编辑模式落表才能保住文本修改
+                            if self._edit_mode:
+                                self._save_current_to_steps_for_edit()
+                            else:
+                                self._save_current_to_steps()
                         self._current_screenshot_filename = screenshot_filename
                         self._current_screenshot_filepath = os.path.join(
                             self.gui_dir, screenshot_filename
                         )
                         self._screenshot_missing = False
-                        self.status_label.setText("截图完成 - 请在图片上拉框标注目标区域，然后填写动作信息")
+                        if appended_from_step:
+                            # 游标移到待确认空位，清表单/标注但保留刚截到的
+                            # 画布内容与 _current_screenshot_* 引用
+                            self.current_step = len(self.steps_data)
+                            self._clear_inputs()
+                            self.canvas.clear_rect()
+                            self._update_step_label()
+                            self._update_navigation_buttons()
+                            self.sidebar.refresh_dashboard()
+                            self.sidebar.refresh_highlight()
+                            self.schedule_draft_save()
+                            self.status_label.setText(
+                                "已为下一步截图 - 请拉框标注并填写动作信息后确认"
+                            )
+                        elif self._capture_append_new_step:
+                            # 已在待确认空位：沿用默认更新，只补草稿与提示
+                            self.schedule_draft_save()
+                            self.status_label.setText(
+                                "已为下一步截图 - 请拉框标注并填写动作信息后确认"
+                            )
+                        else:
+                            self.status_label.setText("截图完成 - 请在图片上拉框标注目标区域，然后填写动作信息")
                 else:
                     # 保存被拒（非法文件名）或写盘失败：原地覆盖模式下旧图未被破坏，
                     # 不能静默无反应，否则用户以为重截已生效
@@ -1515,6 +1632,7 @@ class AnnotationEditor(QMainWindow):
         # 无论成功与否都复位标记，避免失败后状态残留影响后续步骤
         self._replacing_screenshot = False
         self._capture_insert_after = None
+        self._capture_append_new_step = False
         self._screenshot_in_progress = False
 
     def _delete_old_screenshot(self):
@@ -1774,7 +1892,7 @@ class AnnotationEditor(QMainWindow):
         if not self._edit_mode:
             return
         if self._screenshot_missing:
-            self.status_label.setText("当前步骤截图缺失，请先[截图]")
+            self.status_label.setText("当前步骤截图缺失，请先[重新截图]")
             return
         filename = self._current_screenshot_filename
         pixmap = None
@@ -1787,7 +1905,7 @@ class AnnotationEditor(QMainWindow):
                 candidate = QPixmap(filepath)
                 pixmap = None if candidate.isNull() else candidate
         if pixmap is None:
-            self.status_label.setText("截图文件缺失，请使用[截图]")
+            self.status_label.setText("截图文件缺失，请使用[重新截图]")
             return
         # 弹窗拖框走普通动作语义，先取消进行中的测量态，
         # 避免拖出的框被当成滑动终点/滚动参照物，也避免清理额外截图时误删文件
@@ -3811,7 +3929,7 @@ class AnnotationEditor(QMainWindow):
         """键盘快捷键处理"""
         # Ctrl+Q: 截图
         if event.key() == Qt.Key_Q and event.modifiers() == Qt.ControlModifier:
-            self.take_screenshot()
+            self.start_capture()
         # Ctrl+S: 保存当前截图并进入下一步
         elif event.key() == Qt.Key_S and event.modifiers() == Qt.ControlModifier:
             self.go_next()
