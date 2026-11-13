@@ -15,3 +15,7 @@
 - [x] `take_screenshot()` 无参调用的默认语义未变，既有测试（recapture/insert/data_integrity）全部通过
 - [x] `ios端/tests/test_capture_entries.py` 覆盖追加/覆盖/退化/门闩/快捷键场景并通过
 - [x] 在 `ios端` 目录执行 `python -m pytest tests -q` 全绿
+- [x] 编辑模式下「给下一步截图」产生的待确认新步可被「确认」提交进 `steps_data`，「保存修改」将新步完整写回 JSON trajectory 与 coords，无孤儿截图、无误报提示
+- [x] 编辑模式下插入截图的锚点步落表走 `_save_current_to_steps_for_edit`：缺图时文本修改不丢，`coord_issue/orig_coord_entry` 标记保留
+- [x] 草稿续采模式下「给下一步截图」「重新截图」行为与新采标一致（追加/覆盖语义、门闩、草稿落盘）
+- [x] 新增回归测试覆盖编辑模式与草稿续采场景，`ios端` 目录 `python -m pytest tests -q` 全绿（157 passed）

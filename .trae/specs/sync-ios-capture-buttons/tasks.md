@@ -25,7 +25,20 @@
 
 - [x] Task 4: 回归验证：在 `ios端` 目录运行 `python -m pytest tests -q`，全部通过；若既有用例因入口拆分回归，按产品语义修正实现而非改测试预期
 
+- [x] Task 5: 修复编辑已完成任务模式下「给下一步截图」的确认死胡同（`ios端/annotation_editor.py`）
+  - [x] SubTask 5.1: `confirm_step` 编辑分支（2451-2477）：当 `current_step == len(steps_data)` 且有待确认截图（`_current_screenshot_filename` 非 None）时，用 `_collect_step_data()` 收集新步并 append 到 `steps_data`，游标留在新步下标，刷新步骤标签/导航按钮/侧栏看板与缺项槽位，提示「已新增第 N 步（编辑模式）」；无截图的越界空位保持早退，不再误报"已更新"
+  - [x] SubTask 5.2: 验证 `save_edited_round` 按 `steps_data` 重建 trajectory/coords（约 3530-3614），新增步可完整写回 JSON 与 coords，不被原 trajectory 长度截断；新步无原条目时不做合并（测试断言通过）
+- [x] Task 6: 修复编辑模式下插入截图的锚点步落表（同文件）
+  - [x] SubTask 6.1: `_do_screenshot` 插入分支（1776-1782）：`_edit_mode` 为真时改调 `_save_current_to_steps_for_edit()`，保住缺图锚点步的文本修改与 `coord_issue/orig_coord_entry` 标记；普通模式行为不变
+- [x] Task 7: 补充编辑模式与草稿续采回归测试（`ios端/tests/test_capture_entries_modes.py`，4 用例）
+  - [x] SubTask 7.1: 编辑模式：「重新截图」原地覆盖且文本保留、不写草稿；「给下一步截图」→「确认」提交新步 →「保存修改」写回新步（JSON trajectory 与 coords 均含新步、受保护字段不被空值覆盖、无孤儿截图）；插入截图在锚点步缺图时保留文本修改与坐标标记
+  - [x] SubTask 7.2: 草稿续采：恢复后「给下一步截图」追加、「重新截图」覆盖，行为与新采标一致
+- [x] Task 8: 回归验证：在 `ios端` 目录运行 `python -m pytest tests -q`，157 passed / 0 failed（基线 153 + 新增 4）；新增 4 用例单独复跑亦全绿
+
 # Task Dependencies
 - Task 2 depends on Task 1
 - Task 3 depends on Task 1、Task 2
 - Task 4 depends on Task 3
+- Task 5、Task 6 相互独立，可并行
+- Task 7 depends on Task 5、Task 6
+- Task 8 depends on Task 7

@@ -71,6 +71,20 @@ iOS 版 `annotation_editor.py` 目前只有一个「截图 (Ctrl+Q)」入口：�
 - **WHEN** 画布为空或处于初始状态
 - **THEN** 提示文案指向 `[给下一步截图(Ctrl+Q)]`，不再指向「截图」
 
+### Requirement: 编辑已完成任务模式下的采集入口
+编辑模式（`_edit_mode=True`）下三个采集入口 SHALL 与新采标模式同样可用，且数据可完整写回：
+- 「给下一步截图」产生的待确认新步 SHALL 能被「确认」提交进 `steps_data`（与 Windows 端编辑模式可保存新增步的语义一致），随后「保存修改」将新步完整写回 JSON trajectory 与 coords，不产生孤儿截图。
+- 「在此步后插入截图」的锚点步落表 SHALL 走编辑模式落表（`_save_current_to_steps_for_edit`），锚点步截图缺失时文本修改不丢，`coord_issue/orig_coord_entry` 标记保留。
+- 「重新截图」原地覆盖当前步截图，intent 等文本修改保留，不写草稿。
+
+#### Scenario: 编辑模式追加新步并写回
+- **WHEN** 编辑模式下点击「给下一步截图」，拉框填写后点击「确认」，再点击「保存修改」
+- **THEN** 新步进入 `steps_data`，写回后的 JSON trajectory 与 coords 均包含该新步，原步骤受保护字段不被空值覆盖
+
+#### Scenario: 草稿续采模式一致性
+- **WHEN** 从草稿恢复任务后使用「给下一步截图」/「重新截图」
+- **THEN** 追加/覆盖语义、门闩与草稿落盘行为与新采标模式完全一致
+
 ## MODIFIED Requirements
 
 ### Requirement: 截图底层入口

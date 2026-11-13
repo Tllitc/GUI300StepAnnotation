@@ -1774,7 +1774,12 @@ class AnnotationEditor(QMainWindow):
                         # 与 current_step 悬空导致幻影追加
                         anchor_valid = 0 <= anchor < len(self.steps_data)
                         if anchor_valid:
-                            self._save_current_to_steps()
+                            # 编辑模式用 edit 版落表：缺图锚点步不早退，
+                            # 保住文本修改与 coord_issue/orig_coord_entry
+                            if self._edit_mode:
+                                self._save_current_to_steps_for_edit()
+                            else:
+                                self._save_current_to_steps()
                         safe_anchor = (
                             anchor
                             if 0 <= anchor < len(self.steps_data)
@@ -2445,6 +2450,25 @@ class AnnotationEditor(QMainWindow):
             return
         if self._edit_mode:
             # 编辑已完成任务：只落当前步，不切轮、不结束任务、不询问新任务
+            if self.current_step == len(self.steps_data):
+                # 「给下一步截图」追加的待确认空位：提交为新步落表，游标留在
+                # 新步下标。缺项校验由 save_edited_round 的 missing_list 承担，
+                # 此处不做轮次迁移/终止动作校验
+                if self._current_screenshot_filename is None:
+                    return
+                self.steps_data.append(self._collect_step_data())
+                self._cancel_swipe_measurement()
+                self._cancel_scroll_measurement()
+                # 缓存长度漂移 → 全量重算并清空 _missing_live
+                self._invalidate_missing_slot(self.current_step)
+                self._update_step_label()
+                self._update_navigation_buttons()
+                self.sidebar.rebuild_items()
+                self.sidebar.refresh_dashboard()
+                self.sidebar.refresh_highlight()
+                self.status_label.setText(
+                    f"已新增第 {self.current_step + 1} 步（编辑模式）")
+                return
             self._save_current_to_steps_for_edit()
             self._cancel_swipe_measurement()
             self._cancel_scroll_measurement()
