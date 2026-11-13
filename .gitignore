@@ -33,3 +33,6 @@ build/
 Thumbs.db
 desktop.ini
 datasubtool/长步骤交付.xlsx
+qctools/语义问题报告_修复后_20261112.md
+qctools/明细_修复后_20261112.json
+qctools/fix_semantic_data_20261110.py
