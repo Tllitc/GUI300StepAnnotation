@@ -78,6 +78,14 @@ def _wait_thumbs_loaded(editor):
     QTest.qWait(20)
 
 
+def _cached_thumb_for(editor, filename):
+    """按文件名从侧栏 LRU 缓存取缩略图（缓存键为 (文件名, 顶点签名)）。"""
+    for key, pixmap in editor.sidebar._thumb_cache.items():
+        if isinstance(key, tuple) and key[0] == filename:
+            return pixmap
+    return None
+
+
 def _select_scroll_action(editor):
     """切到 scroll 动作（动作表单随产品逻辑显隐，测量按钮可见）。"""
     index = editor.action_combo.findData("scroll")
@@ -148,7 +156,9 @@ def test_recapture_history_step_keeps_number_updates_content(editor, qapp):
         editor.sidebar.item_widgets[1].thumb_label.pixmap()
     )
     assert old_thumb_pixel == _expected_color(old_idx)
-    assert target_name in editor.sidebar._thumb_cache, "替换前缩略图应已被 LRU 缓存"
+    assert _cached_thumb_for(editor, target_name) is not None, (
+        "替换前缩略图应已被 LRU 缓存"
+    )
 
     # ---- 走真实“重新截图”入口：历史步已有 _current_screenshot_filepath，
     #      take_screenshot 置 _replacing_screenshot，_do_screenshot 原地覆盖 ----
@@ -209,7 +219,7 @@ def test_recapture_history_step_keeps_number_updates_content(editor, qapp):
         f"!= {_expected_color(new_idx)}"
     )
     # 重载完成后若缓存重新填充，其内容也必须是新图而非旧图
-    cached_pm = editor.sidebar._thumb_cache.get(target_name)
+    cached_pm = _cached_thumb_for(editor, target_name)
     if cached_pm is not None:
         assert _pix_top_center_rgb(cached_pm) == _expected_color(new_idx), (
             "缩略图缓存中仍是旧内容"

@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QListWidgetItem, QSizePolicy, QSpacerItem)
 from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal, QRect
 from PyQt5.QtGui import (QPixmap, QImage, QFont, QPainter, QPen, QColor,
-                         QKeySequence, QFontMetrics)
+                         QKeySequence, QFontMetrics, QIcon)
 
 from screenshot_capture import ScreenshotCaptureWindow
 from data_manager import DataManager
@@ -1302,6 +1302,11 @@ class SideBarWidget(QWidget):
 
         self.jump_spin.setMaximum(max(total, 1))
 
+        # 已完成轮次回看入口：仅在存在已落轮数据时可用（按钮可能尚未创建）
+        view_rounds_btn = getattr(self.editor, "view_rounds_btn", None)
+        if view_rounds_btn is not None:
+            view_rounds_btn.setEnabled(bool(self.editor.rounds))
+
     def set_draft_saving(self):
         self.draft_time_label.setText("自动保存: 保存中…")
 
@@ -1371,6 +1376,240 @@ class ValidationFailDialog(QDialog):
     def target_index(self):
         """对话框关闭后读取用户请求跳转的下标；未选择跳转返回 None"""
         return self._target_index
+
+
+class RoundPreviewDialog(QDialog):
+    """已完成轮次只读回看：轮次下拉 + 缩略图列表 + 大图预览。
+
+    严格只读：不修改 editor.steps / editor.rounds / editor.all_coords_entries，
+    也不触发草稿写盘；缩略图使用本对话框独立的 LRU，不与侧栏共享。
+    """
+
+    THUMB_SIZE = QSize(160, 90)
+    THUMB_CACHE_LIMIT = 128
+    BATCH_SIZE = 20
+
+    # 常见动作英文 → 中文展示名（未知动作直接显示原文）
+    ACTION_CN = {
+        "left_click": "左键单击",
+        "double_click": "双击",
+        "triple_click": "三击",
+        "right_click": "右键单击",
+        "middle_click": "中键单击",
+        "left_click_drag": "拖拽",
+        "mouse_move": "鼠标移动",
+        "scroll": "滚动",
+        "type": "文本输入",
+        "key": "按键组合",
+        "wait": "等待",
+        "answer": "回答用户",
+        "answer_terminate": "回答并结束",
+        "terminate": "任务完成",
+        "open_app": "打开app",
+        "open_url": "打开网页",
+        "system_button": "系统按键",
+    }
+
+    def __init__(self, editor, parent=None):
+        super().__init__(parent if parent is not None else editor)
+        self.editor = editor
+        self.setWindowTitle("已完成轮次回看")
+        self.resize(980, 620)
+
+        # 只读快照：按轮分组的坐标条目（长度与 rounds 等长）
+        self._groups = editor._group_coords_by_round(
+            editor.rounds, editor.all_coords_entries
+        )
+        # 本对话框独立的缩略图 LRU（不复用侧栏缓存）
+        self._thumb_cache = OrderedDict()
+        self._pending_items = []
+        self._current_index = -1
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setSingleShot(True)
+        self._thumb_timer.timeout.connect(self._load_thumb_batch)
+
+        self._init_ui()
+        self._populate_rounds()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # ===== 顶部：轮次选择 =====
+        top_layout = QHBoxLayout()
+        top_layout.addWidget(QLabel("轮次："))
+        self.round_combo = QComboBox()
+        self.round_combo.setMinimumWidth(360)
+        self.round_combo.currentIndexChanged.connect(self._on_round_changed)
+        top_layout.addWidget(self.round_combo)
+        self.step_count_label = QLabel("步数：0")
+        top_layout.addWidget(self.step_count_label)
+        top_layout.addStretch()
+        layout.addLayout(top_layout)
+
+        # ===== 中部：缩略图列表 + 大图预览 =====
+        splitter = QSplitter(Qt.Horizontal)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setViewMode(QListWidget.IconMode)
+        self.list_widget.setIconSize(self.THUMB_SIZE)
+        self.list_widget.setGridSize(QSize(170, 130))
+        self.list_widget.setResizeMode(QListWidget.Adjust)
+        self.list_widget.setMovement(QListWidget.Static)
+        self.list_widget.setSpacing(6)
+        self.list_widget.currentRowChanged.connect(self._on_item_selected)
+        splitter.addWidget(self.list_widget)
+
+        self.preview_label = QLabel("请选择左侧步骤查看大图")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumSize(480, 300)
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setStyleSheet(
+            "background-color: #2b2b2b; color: #dddddd; border: 1px solid #444;"
+        )
+        splitter.addWidget(self.preview_label)
+
+        splitter.setSizes([280, 700])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
+
+    # ---------- 轮次 / 条目构建 ----------
+
+    def _populate_rounds(self):
+        self.round_combo.blockSignals(True)
+        for index, round_data in enumerate(self.editor.rounds):
+            instruction = (round_data or {}).get("instruction") or ""
+            self.round_combo.addItem(
+                f"第 {index + 1} 轮 · {instruction[:30]}"
+            )
+            self.round_combo.setItemData(index, instruction, Qt.ToolTipRole)
+        self.round_combo.blockSignals(False)
+        if self.round_combo.count() > 0:
+            self.round_combo.setCurrentIndex(0)
+            self._on_round_changed(0)
+        else:
+            self._on_round_changed(-1)
+
+    def _on_round_changed(self, round_index):
+        """切换轮次：清空列表与预览，重建该轮条目并批量生成缩略图"""
+        self._thumb_timer.stop()
+        self._pending_items = []
+        self._current_index = -1
+        self.list_widget.clear()
+        self._set_preview_text("请选择左侧步骤查看大图")
+
+        if not (0 <= round_index < len(self.editor.rounds)):
+            self.step_count_label.setText("步数：0")
+            return
+
+        trajectory = self.editor.rounds[round_index].get("trajectory") or []
+        self.step_count_label.setText(f"步数：{len(trajectory)}")
+        group = self._groups[round_index] if round_index < len(self._groups) else []
+
+        for i, step_data in enumerate(trajectory):
+            action_cn = self._action_cn(step_data)
+            step_no = step_data.get("step") if isinstance(step_data, dict) else None
+            entry = self.editor._find_coord_entry(group, step_no)
+            if entry is not None:
+                rect_info, selection_type = \
+                    self.editor._rect_info_from_coord_entry(entry)
+            else:
+                rect_info, selection_type = (), None
+            filename = ((step_data or {}).get("observation") or {}).get("screenshot")
+            item = QListWidgetItem(f"第 {i + 1} 步 · {action_cn}")
+            item.setToolTip(f"第 {i + 1} 步 · {action_cn}\n{filename or '（无截图）'}")
+            item.setData(Qt.UserRole, (filename, rect_info, selection_type))
+            self.list_widget.addItem(item)
+            self._pending_items.append(item)
+
+        if self._pending_items:
+            self._thumb_timer.start(10)
+
+    def _action_cn(self, step_data):
+        actions = (step_data or {}).get("actions")
+        if not isinstance(actions, list) or not actions:
+            return "-"
+        action = actions[0].get("action") if isinstance(actions[0], dict) else None
+        if not action:
+            return "-"
+        return self.ACTION_CN.get(action, action)
+
+    # ---------- 缩略图 ----------
+
+    def _cache_key(self, filename, rect_info, selection_type):
+        return (filename, repr(rect_info), selection_type)
+
+    def _thumb_for(self, filename, rect_info, selection_type):
+        """生成/命中缩略图；文件缺失或无法加载返回 None"""
+        key = self._cache_key(filename, rect_info, selection_type)
+        if key in self._thumb_cache:
+            self._thumb_cache.move_to_end(key)
+            return self._thumb_cache[key]
+        if not filename:
+            return None
+        pixmap = self.editor.build_marked_preview(
+            filename, rect_info, selection_type, self.THUMB_SIZE
+        )
+        if pixmap is None or pixmap.isNull():
+            return None
+        self._thumb_cache[key] = pixmap
+        self._thumb_cache.move_to_end(key)
+        while len(self._thumb_cache) > self.THUMB_CACHE_LIMIT:
+            self._thumb_cache.popitem(last=False)
+        return pixmap
+
+    def _load_thumb_batch(self):
+        """每 10ms 批量生成 20 个缩略图，避免大轮次阻塞界面"""
+        if not self._pending_items:
+            return
+        batch = self._pending_items[:self.BATCH_SIZE]
+        self._pending_items = self._pending_items[self.BATCH_SIZE:]
+        for item in batch:
+            payload = item.data(Qt.UserRole) or (None, (), None)
+            pixmap = self._thumb_for(*payload)
+            if pixmap is not None and not pixmap.isNull():
+                item.setIcon(QIcon(pixmap))
+        if self._pending_items:
+            self._thumb_timer.start(10)
+        elif self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(0)
+
+    # ---------- 大图预览 ----------
+
+    def _set_preview_text(self, text):
+        self.preview_label.clear()
+        self.preview_label.setText(text)
+
+    def _on_item_selected(self, row):
+        self._current_index = row
+        if not (0 <= row < self.list_widget.count()):
+            self._set_preview_text("请选择左侧步骤查看大图")
+            return
+        item = self.list_widget.item(row)
+        payload = item.data(Qt.UserRole) or (None, (), None)
+        self._show_preview(*payload)
+
+    def _show_preview(self, filename, rect_info, selection_type):
+        if not filename:
+            self._set_preview_text("截图文件缺失或无法加载")
+            return
+        target_size = self.preview_label.size()
+        if target_size.width() < 2 or target_size.height() < 2:
+            target_size = QSize(640, 360)
+        pixmap = self.editor.build_marked_preview(
+            filename, rect_info, selection_type, target_size
+        )
+        if pixmap is None or pixmap.isNull():
+            self._set_preview_text("截图文件缺失或无法加载")
+            return
+        self.preview_label.setPixmap(pixmap)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not hasattr(self, "list_widget"):
+            return
+        if 0 <= self._current_index < self.list_widget.count():
+            self._on_item_selected(self._current_index)
 
 
 class AnnotationEditor(QMainWindow):
@@ -1524,6 +1763,12 @@ class AnnotationEditor(QMainWindow):
         self.relabel_btn.clicked.connect(self.relabel_current_step)
         self.relabel_btn.hide()
         toolbar.addWidget(self.relabel_btn)
+
+        # 只读回看已完成轮次（有轮次时由 refresh_dashboard 启用）
+        self.view_rounds_btn = QPushButton("查看已完成轮次")
+        self.view_rounds_btn.clicked.connect(self.show_round_preview_dialog)
+        self.view_rounds_btn.setEnabled(False)
+        toolbar.addWidget(self.view_rounds_btn)
 
         # macOS 版全局热键由 pynput 子进程监听物理 Control+Q（见 main.py）
         screenshot_hk = "Control"
@@ -1787,6 +2032,9 @@ class AnnotationEditor(QMainWindow):
 
     def recapture_current_step(self):
         """重新截取当前步骤的截图，如果没有步骤则开始第一个截图"""
+        if self._final_data_saved and not self._edit_mode:
+            self.status_label.setText("任务已保存，请先选择是否开始新任务")
+            return
         if self._round_transition_pending:
             self.status_label.setText("轮次切换中，请稍候...")
             return
@@ -1820,6 +2068,9 @@ class AnnotationEditor(QMainWindow):
 
     def relabel_current_step(self):
         """编辑已完成任务：在该步磁盘原截图上重新拖框（不重新截图、不覆盖 PNG）"""
+        if self._final_data_saved and not self._edit_mode:
+            self.status_label.setText("任务已保存，请先选择是否开始新任务")
+            return
         if self._round_transition_pending:
             self.status_label.setText("轮次切换中，请稍候...")
             return
@@ -1960,6 +2211,9 @@ class AnnotationEditor(QMainWindow):
 
     def start_capture(self):
         """开始截图捕获（追加模式：新步骤加到末尾）"""
+        if self._final_data_saved and not self._edit_mode:
+            self.status_label.setText("任务已保存，请先选择是否开始新任务")
+            return
         if self._round_transition_pending:
             self.status_label.setText("轮次切换中，请稍候...")
             return
@@ -1970,6 +2224,9 @@ class AnnotationEditor(QMainWindow):
 
     def start_insert_capture(self):
         """在当前步骤之后插入一步截图（插入模式）"""
+        if self._final_data_saved and not self._edit_mode:
+            self.status_label.setText("任务已保存，请先选择是否开始新任务")
+            return
         if self._round_transition_pending:
             self.status_label.setText("轮次切换中，请稍候...")
             return
@@ -2256,6 +2513,9 @@ class AnnotationEditor(QMainWindow):
 
     def delete_current_step(self):
         """删除当前步骤：二次确认后删除步骤/页面/磁盘截图，后续步骤自动前移重编号"""
+        if self._final_data_saved and not self._edit_mode:
+            self.status_label.setText("任务已保存，请先选择是否开始新任务")
+            return
         if self._round_transition_pending:
             self.status_label.setText("轮次切换中，请稍候...")
             return
@@ -2381,6 +2641,12 @@ class AnnotationEditor(QMainWindow):
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation
         )
+
+    def show_round_preview_dialog(self):
+        """只读回看已完成轮次（不修改任何现场数据，不触发草稿写盘）"""
+        if not self.rounds:
+            return
+        RoundPreviewDialog(self).exec_()
 
     def _refresh_step_preview(self, index):
         """用磁盘文件刷新指定步骤的预览图（不缓存全屏图）"""
@@ -2544,6 +2810,10 @@ class AnnotationEditor(QMainWindow):
         self.showMinimized()
 
     def confirm_button_clicked(self):
+        # 已交付后必须先把「是否开始新任务」走完，未选之前禁止继续编辑/落轮
+        if self._final_data_saved and not self._edit_mode:
+            self.status_label.setText("任务已保存，请先选择是否开始新任务")
+            return
         # B2：切轮窗口内的确认会被旧指令再次落轮，直接拒绝
         if self._round_transition_pending:
             self.status_label.setText("轮次切换中，请稍候...")
@@ -2585,6 +2855,47 @@ class AnnotationEditor(QMainWindow):
         current_step = self.steps[self.current_step_index]
         editor = current_step["editor"]
 
+        # 编辑已完成任务：确认只落当前步数据，不触发 answer/terminate 的轮次迁移
+        if self._edit_mode:
+            step_data = editor.get_data()
+            step_num = self.get_current_step_number()
+            step_data_with_step = {"step": step_num}
+            step_data_with_step.update(step_data)
+            step_data = step_data_with_step
+            step_data["observation"]["screenshot"] = current_step["screenshot_filename"]
+            # 与原 data 合并：受保护下游字段（CoT/observation.ui_tree_segment 等）为空值
+            # 时保留原值，避免编辑器重建字典把下游字段清空；新增步骤无原 data 时直接写入
+            original_data = current_step.get("data")
+            if isinstance(original_data, dict):
+                step_data = self._merge_step_with_original(step_data, original_data)
+            current_step["data"] = step_data
+            current_step["confirmed"] = True
+            self.status_label.setText(f"步骤 {step_num} 已保存（编辑模式）")
+            self.update_step_indicator()
+            self.refresh_step_item(self.current_step_index)
+            self.refresh_dashboard()
+            return
+
+        # 终止类动作必须是本轮最后一步：在修改任何状态之前拦截，
+        # 当前步就是最后一步（或下标越界/空位）时不受影响
+        selected_action_type = editor.action_type_mapping.get(
+            editor.action_type_combo.currentText(), editor.action_type_combo.currentText()
+        )
+        if selected_action_type in ("answer", "answer_terminate", "terminate") \
+                and 0 <= self.current_step_index < len(self.steps) - 1:
+            remaining = len(self.steps) - 1 - self.current_step_index
+            QMessageBox.warning(
+                self, "提示",
+                "终止类动作必须是本轮最后一个步骤。\n"
+                f"当前第 {self.current_step_index + 1} 步之后还有 {remaining} 个步骤，"
+                "请先删除或撤销后续步骤后再确认。"
+            )
+            self.status_label.setText(
+                f"终止类动作必须是本轮最后一个步骤：当前第 "
+                f"{self.current_step_index + 1} 步之后还有 {remaining} 个步骤"
+            )
+            return
+
         # 获取编辑数据
         step_data = editor.get_data()
 
@@ -2597,7 +2908,7 @@ class AnnotationEditor(QMainWindow):
         # 设置截图文件名
         step_data["observation"]["screenshot"] = current_step["screenshot_filename"]
 
-        # 编辑已存在步骤（草稿/续采/编辑模式）：与原快照合并，受保护下游字段空值
+        # 编辑已存在步骤（草稿/续采）：与原快照合并，受保护下游字段空值
         # 保留原值，避免编辑器重建字典把下游字段清空；新增步骤无原 data，直接写入
         original_data = current_step.get("data")
         if isinstance(original_data, dict):
@@ -2610,16 +2921,30 @@ class AnnotationEditor(QMainWindow):
 
         # 检查是否为 answer / answer_terminate 动作
         actions = step_data.get("actions", [])
-        selected_action_type = editor.action_type_mapping.get(
-            editor.action_type_combo.currentText(), editor.action_type_combo.currentText()
-        )
         if selected_action_type == "answer":
+            # 落轮前全轮必填校验（与 terminate 分支同口径）：存在缺失则保持现场，
+            # 不落轮也不清空 steps，避免把缺项轮次写进 rounds
+            missing_entries = []
+            for i in range(len(self.steps)):
+                reasons = self.validate_step_at(i)
+                if reasons:
+                    missing_entries.append((i, self._action_cn_name(i), reasons))
+            if missing_entries:
+                current_step["confirmed"] = previous_confirmed
+                self.revalidate_all_missing()
+                self.refresh_step_item(self.current_step_index)
+                self.refresh_dashboard()
+                self._show_validation_fail_dialog(missing_entries)
+                return
             # answer 动作：保存后直接开始新一轮任务
             current_step["data"] = step_data
             self.status_label.setText(f"步骤 {step_num} 已保存（回答用户）")
 
             # 保存当前轮次并直接开始新任务
-            self.save_current_round()
+            if not self.save_current_round():
+                # B14：本轮缺少任务指令且用户未补齐 → 拒绝落轮。此时绝不能清空
+                # steps，否则整轮轨迹会静默消失（比指令错乱更严重）
+                return
             # 清空步骤列表，避免后续重复保存
             self.steps = []
             # 升起门闩，300ms 切轮窗口内禁止采集/编辑（B2）
@@ -2647,7 +2972,9 @@ class AnnotationEditor(QMainWindow):
             self.status_label.setText(f"步骤 {step_num} 已保存（{finish_label}）")
 
             # 立即保存当前轮次到 rounds 列表，防止弹窗前窗口关闭导致数据丢失
-            self.save_current_round()
+            if not self.save_current_round():
+                # B14：同上，缺指令被拒绝落轮时保持 steps 原样，等用户补齐指令
+                return
             # 清空步骤列表，避免 finish_all_annotation 重复保存
             self.steps = []
 
@@ -2751,8 +3078,39 @@ class AnnotationEditor(QMainWindow):
 
         return entries
 
-    def save_current_round(self):
-        """保存当前轮次的数据到 rounds 列表"""
+    def _prompt_missing_instruction(self):
+        """本轮缺少任务指令时弹窗补齐；返回 False 表示用户仍未给出指令。
+
+        B14：取消新轮后 task_instruction 被置空（见 start_new_round 取消分支）。
+        放任空指令落轮的话，新一轮轨迹会静默挂到上一轮的旧指令上，事后无从
+        分辨哪段轨迹属于哪条指令，因此落轮前必须显式补齐，补齐失败由调用方拒绝落轮。
+        """
+        from PyQt5.QtWidgets import QInputDialog
+
+        self.restore_window()
+        new_instruction, ok = QInputDialog.getText(
+            self,
+            "任务指令",
+            "当前轮次缺少任务指令，请输入本轮对应的指令：",
+            QLineEdit.Normal,
+            ""
+        )
+        if ok and new_instruction.strip():
+            self.task_instruction = new_instruction.strip()
+            return True
+        self.status_label.setText("缺少任务指令 - 本轮未落轮，请补齐指令后重新确认")
+        return False
+
+    def save_current_round(self, prompt_instruction=True):
+        """保存当前轮次的数据到 rounds 列表
+        :param prompt_instruction: 指令缺失时是否弹窗补齐；关闭等无人值守路径传 False，
+            只做静默拒绝，不在退出过程中弹模态框
+        :return: True 表示本轮已落入 rounds；False 表示因缺少任务指令被拒绝落轮，
+            调用方必须保持 steps 原样并中止后续的清空/切轮动作
+        """
+        if not (self.task_instruction or "").strip():
+            if not prompt_instruction or not self._prompt_missing_instruction():
+                return False
         # 说明（删除/插入对齐）：本方法是轮次结束时唯一的落盘点，trajectory 与 coords
         # entries 都在此刻按当时 self.steps 的 enumerate 下标 i 现场重建。轮次中途的
         # 删除/插入只会改变 self.steps 顺序，任何 data 快照里旧的 "step" 不被读取
@@ -2790,12 +3148,23 @@ class AnnotationEditor(QMainWindow):
         })
 
         # 提取需要坐标的步骤，收集其拉框顶点和中心点坐标
-        self.all_coords_entries.extend(self._collect_coords_entries())
+        # 4.2（B4/B18）落轮时给每个 coords 条目注入 round：轮内 step 下标每轮都从 0
+        # 起重编，扁平坐标文件里 (step, action) 无法唯一归属。早前不写 round，读取
+        # 只能靠「step 变小则切段」猜测，只要有一轮一个坐标步都没有、或两轮 step
+        # 同签名，就整段错位把顶点配到别的轮次上。iOS 在序列化边界注入；本端正常
+        # 路径只保留扁平 all_coords_entries（rounds 内不存坐标分组），故在唯一的
+        # 追加点上当前轮下标，口径等价。条目由 _collect_coords_entries 现场新建，
+        # 就地加键不会别名到步骤数据。
+        round_index = len(self.rounds) - 1
+        for coords_entry in self._collect_coords_entries():
+            coords_entry["round"] = round_index
+            self.all_coords_entries.append(coords_entry)
 
         # DT-2 修复：不再在 save_current_round 内部立即 _write_draft_now()。
         # 调用方（save_current_step / finish_all_annotation / closeEvent）会在 steps 状态就绪后
         # 通过 schedule_draft_save 或 delete_draft 处理。这样避免了"rounds 已追加、steps 还没清"
         # 的瞬间 draft 同时包含本轮轨迹和 current_steps，防止崩溃恢复后同一轮被重复写入最终 JSON。
+        return True
 
     def schedule_draft_save(self):
         """重启防抖定时器，1s 内无新变化后写 draft"""
@@ -3645,8 +4014,8 @@ class AnnotationEditor(QMainWindow):
 
     def show_new_task_dialog(self):
         """显示是否创建新任务的对话框"""
-        # 门闩回调已进场，切轮窗口结束，恢复采集/编辑入口（B2）
-        self._round_transition_pending = False
+        # 门闩保持为 True：直到 create_new_task → reset_for_new_task 才复位；
+        # 选「否」直接关闭窗口。期间任何采集/编辑入口都必须早退（B2）
         # 确保主窗口在前台
         self.restore_window()
 
@@ -3738,19 +4107,41 @@ class AnnotationEditor(QMainWindow):
         else:
             # 用户取消了
             if from_answer:
-                # 如果是从 answer 动作触发，只关闭弹窗，不保存退出
-                self.status_label.setText("已取消新任务")
+                # 2.3（B1）answer 分支已把当前轮落入 rounds 并清空 steps，但 stack 里
+                # 上一轮的编辑页、current_step_index、侧栏条目都还在原地：用户看到的
+                # 仍是上一轮的表单与截图残留，此时继续采集就接在陈旧界面上。
+                # 取消新轮必须与接受新轮走同一个重置入口，回到只剩空白页的起点。
+                # B14：重置前先清空 task_instruction —— 上一轮已随 answer 落轮并被
+                # 消费，继续留着旧指令，用户接着采集的整轮就会被挂到上一条指令上。
+                self.cancel_next_round_instruction()
             else:
                 # 否则完成所有标注
                 self.finish_all_annotation()
+
+    def cancel_next_round_instruction(self):
+        """answer 落轮 / 续采恢复后用户取消下一条指令：清空已消费的旧指令并重置工作区"""
+        self._round_transition_pending = False
+        self.task_instruction = ""
+        self.reset_for_new_task()
+        self.status_label.setText("已取消新任务 - 可继续截图标注")
 
     def finish_all_annotation(self, close_after_save=True):
         """完成所有轮次的标注并保存
         :param close_after_save: 保存后是否关闭窗口。False 时返回初始化菜单
         """
+        # 已交付后重复调用不得重复写盘/重复删除草稿（「是否开始新任务」期间的保护）
+        if self._final_data_saved:
+            return
         # 先保存当前轮次（如果有的话）
         if len(self.steps) > 0:
-            self.save_current_round()
+            # B14：缺指令被拒绝落轮时中止收尾，不写出缺最后一轮的交付文件
+            if not self.save_current_round():
+                QMessageBox.warning(
+                    self, "缺少任务指令",
+                    "当前轮次还没有任务指令，已中止保存以免轨迹挂到错误指令上。\n"
+                    "请重新确认本步并输入本轮指令后再完成标注。"
+                )
+                return
 
         # 保存所有轮次的数据
         if len(self.rounds) == 0:
@@ -3799,6 +4190,9 @@ class AnnotationEditor(QMainWindow):
             self.data_manager.delete_draft(self.gui_number)
             # 标记已最终保存，随后的 closeEvent 不再对同一批数据二次落盘
             self._final_data_saved = True
+            # 交付完成后保持门闩，直到用户明确选择「是否开始新任务」
+            # （create_new_task → reset_for_new_task 才复位；选「否」直接关窗）
+            self._round_transition_pending = True
 
             msg = f"所有轮次数据已保存到:\n{filepath}"
             if coords_filepath:
@@ -3825,6 +4219,7 @@ class AnnotationEditor(QMainWindow):
         # 那批数据有效。不重置时，新任务中途关窗会被 closeEvent 当成“已保存”而
         # 跳过草稿落盘，整轮进度静默丢失。
         self._final_data_saved = False
+        self._round_transition_pending = False
         self.steps = []
         self.current_step_index = -1
         # 注意：不重置 gui_number，整个任务共用同一个文件夹

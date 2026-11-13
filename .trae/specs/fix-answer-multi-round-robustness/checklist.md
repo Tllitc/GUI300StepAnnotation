@@ -1,0 +1,21 @@
+- [x] 四端在 answer / answer_terminate / terminate 确认时均拦截「本轮中间步」，拦截后 `rounds` 不增加、`steps` 完整保留、无交付 JSON 写出（Windows `save_current_step`、macOS 同名、安卓/iOS `confirm_step`，各自用例覆盖）
+- [x] 末步与未确认空白位仍可正常落轮/结束，既有单轮与多轮用例不回归（四端全量测试通过）
+- [x] Windows answer 分支落轮前对全轮执行 `validate_step_at`，缺项弹清单并保持现场（`tests/test_answer_round_flow.py::TestAnswerFullRoundValidation`）
+- [x] macOS answer 分支落轮前对全轮执行 `validate_step_at`，缺项弹清单并保持现场（`test_answer_blocked_by_missing_fields_in_other_step`）
+- [x] macOS `save_current_round` 缺指令时拒绝落轮并返回 False；`finish_all_annotation` 失败时不写交付 JSON（`test_missing_instruction_rejects_round`）
+- [x] macOS 编辑已完成任务时确认 answer/terminate 不追加轮次、不弹新轮对话框，写回 messages 无重复轮（`test_edit_mode_answer_step_does_not_start_new_round`）
+- [x] macOS 落轮 coords 条目携带 `round`，两轮同签名坐标可正确归属（`test_coords_entries_carry_round_index`，round 0/1）
+- [x] macOS answer 后取消新轮：界面复位、`task_instruction` 为空、已落轮数据与草稿 rounds 完好（`test_cancel_next_round_resets_workspace`）
+- [x] Windows / iOS / macOS 续采恢复后取消下一条指令：`task_instruction` 清空，后续轮次不得复用旧指令（三端 main.py 取消分支 + Windows/macOS `cancel_next_round_instruction`、iOS `_reset_workspace_after_cancel`）
+- [x] 四端交付成功后（含 answer_terminate）截图/重截图/插入/确认入口被门闩拦截，不产生新步骤与孤儿 PNG（各端 `test_capture..._blocked_after_delivery`）
+- [x] `_finish_task` / `finish_all_annotation` 可重入安全（Android/iOS `_finish_task` 早退；Windows/macOS `finish_all_annotation` 增加 `_final_data_saved` 早退，且交付后门闩常驻）
+- [x] 四端存在「查看已完成轮次」只读入口，无已完成轮次时禁用（`view_rounds_btn` + dashboard 按 `rounds` 启停，初始禁用）
+- [x] 回看器轮次下拉列出全部已完成轮次，切换后步骤缩略图与预览整体切换、无上一轮残留（四端回看器用例断言列表条数与第二轮步数）
+- [x] 回看器缩略图/大图按该轮 coords 条目绘制标注框；截图缺失/条目缺失时降级显示且不崩溃（Windows/macOS 用 `_rect_info_from_coord_entry`，移动端用 vertices；缺失返回 None 时显示「截图文件缺失或无法加载」）
+- [x] 回看器为独立 LRU 缓存并分批生成缩略图，300+ 步场景不阻塞、不持有全屏原图（`OrderedDict` 上限 128，每 10ms 批量 20 张）
+- [x] 打开/关闭回看器后主界面 `steps`/`rounds`/coords/草稿/当前步无任何变化（四端用例均 deepcopy 对比）
+- [x] 落轮、切轮或取消新轮后侧栏缩略图队列与预览画布已复位，不展示上一轮画面（macOS 取消分支改走 `reset_for_new_task`；其余端原有重建/清画布路径）
+- [x] iOS 缩略图缓存键包含框顶点，陈旧队列项被丢弃，重拉框后不会复用旧框缩略图（`test_sidebar_thumb_cache_key_and_stale_queue`）
+- [x] 四端新增 `test_answer_round_flow.py` 用例可运行并通过（Windows 6 项、安卓 7 项、iOS 7 项、macOS 9 项）
+- [x] `python -m pytest tests -q` 在根目录、安卓端、ios端、macos端均全部通过：实测 108 / 144 / 148 / 88（基线 102 / 137 / 141 / 79 均无回归）
+- [x] 未修改与 answer 多轮无关的生产逻辑，未引入临时文件（`git status` 仅本次改动文件；工作区既有的 qctools 删除为用户原有变更，未触碰）

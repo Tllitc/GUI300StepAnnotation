@@ -917,6 +917,10 @@ class InitTaskWindow(QMainWindow):
             self.annotation_window.status_label.setText(
                 f"新任务开始 - 指令: {self.annotation_window.task_instruction} - 请截图"
             )
+        else:
+            # 取消续采：清空上一轮已消费的指令与残留界面，避免后续采集
+            # 静默挂到旧指令上（与 answer 切轮的取消分支同一口径）
+            self.annotation_window._reset_workspace_after_cancel()
 
 
 def main():

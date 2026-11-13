@@ -429,7 +429,7 @@ def walk_rounds(editor, rounds_spec, finish_action="terminate"):
         if not is_last:
             last_idx = len(editor.steps) - 1
             fill_step(editor, last_idx, action_chinese="回答用户",
-                      intent=None, text=f"第{r + 1}轮回答")
+                      intent=f"第{r + 1}轮回答", text=f"第{r + 1}轮回答")
             confirm(editor)
             # answer 分支：save_current_round（同步）+ singleShot(300) start_new_round
             # （异步）。task_instruction 的切换发生在 300ms 之后的对话框回调里，

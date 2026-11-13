@@ -735,9 +735,10 @@ def test_insert_draft_resume_and_reinsert(editor, qapp, dm):
         ]
         assert_all(ed2)
 
-        # 结束任务：当前停在 index2（0002）。finish_task 在该步切 terminate
-        # 并 confirm 触发真实 _finish_task（结束前全量校验，terminate 不要求
-        # 位于末步）；问答临时置 No -> 落盘后 close，不开始新任务。
+        # 结束任务：终止类动作必须是本轮最后一步，先切到末步（0003），
+        # 再走真实 _finish_task（结束前全量校验）；问答临时置 No -> 落盘后
+        # close，不开始新任务。
+        ed2.display_step(3)
         finish_task(ed2, continue_new=False)
 
         assert ed2._draft_discarded is True

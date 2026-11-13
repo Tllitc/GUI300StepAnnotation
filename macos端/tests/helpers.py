@@ -420,7 +420,10 @@ def walk_rounds(editor, rounds_spec, finish_action="terminate"):
         is_last = (r == total - 1)
 
         if ctrl is not None and not is_last:
+            # DialogController.get_text 以 getText_result_text 作为应答文本；
+            # next_instruction 同写一份，兼容按该属性语义预期的用例
             ctrl.next_instruction = rounds_spec[r + 1][1]
+            ctrl.getText_result_text = rounds_spec[r + 1][1]
         editor.task_instruction = instruction
 
         walk_steps(editor, n_steps, action_chinese=action_cn,
@@ -429,7 +432,7 @@ def walk_rounds(editor, rounds_spec, finish_action="terminate"):
         if not is_last:
             last_idx = len(editor.steps) - 1
             fill_step(editor, last_idx, action_chinese="回答用户",
-                      intent=None, text=f"第{r + 1}轮回答")
+                      intent=f"第{r + 1}轮回答", text=f"第{r + 1}轮回答")
             confirm(editor)
             # answer 分支：save_current_round（同步）+ singleShot(300) start_new_round
             # （异步）。task_instruction 的切换发生在 300ms 之后的对话框回调里，

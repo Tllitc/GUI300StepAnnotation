@@ -82,7 +82,7 @@ class TestDT2:
 
         # 第 3 步做 answer 动作
         editor.display_step(1)
-        H.fill_step(editor, 1, action_chinese="回答并结束", intent=None, text="好的")
+        H.fill_step(editor, 1, action_chinese="回答并结束", intent="回答", text="好的")
         # confirm_button_clicked 里 answer_terminate 走 save_current_step(terminate 分支)
         # 让它触发 save_current_round → steps=[] → schedule_draft_save
         H.confirm(editor)  # 这会走 save_current_step 内部分支

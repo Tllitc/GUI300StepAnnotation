@@ -522,7 +522,7 @@ def _answer_round_then_cancel(editor, dialogs, n_steps=2):
     """
     H.walk_steps(editor, n_steps)
     last_idx = len(editor.steps) - 1
-    H.fill_step(editor, last_idx, action_chinese="回答用户", intent=None,
+    H.fill_step(editor, last_idx, action_chinese="回答用户", intent="第一轮回答",
                 text="第一轮回答")
     shots = [step["screenshot_filename"] for step in editor.steps]
 

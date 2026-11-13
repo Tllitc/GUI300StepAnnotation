@@ -477,7 +477,7 @@ class TestMultiRoundGlobalShots:
                 # 300ms QTimer 后 start_new_round 弹 QInputDialog 取下一轮 instruction
                 last_idx = len(editor.steps) - 1
                 H.fill_step(editor, last_idx, action_chinese="回答用户",
-                            intent=None, text=f"第{r + 1}轮回答")
+                            intent=f"第{r + 1}轮回答", text=f"第{r + 1}轮回答")
                 H.confirm(editor)
                 # 等 300ms singleShot(start_new_round) + getText + reset_for_new_task
                 QTest.qWait(500)

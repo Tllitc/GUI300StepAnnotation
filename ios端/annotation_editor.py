@@ -17,9 +17,11 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QComboBox, QLineEdit,
                              QScrollArea, QSplitter, QFrame, QMessageBox,
                              QInputDialog, QGroupBox, QFormLayout, QTextEdit,
-                             QDialog, QListWidget, QListWidgetItem, QSpinBox)
+                             QDialog, QListWidget, QListWidgetItem, QSpinBox,
+                             QListView)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QRect, QSize
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QFont, QFontMetrics
+from PyQt5.QtGui import (QPixmap, QImage, QPainter, QPen, QColor, QFont,
+                         QFontMetrics, QIcon)
 from screenshot_capture import IOSScreenCapture
 from data_manager import DataManager
 
@@ -477,8 +479,8 @@ class SideBarWidget(QWidget):
         super().__init__()
         self.editor = editor
         self.item_widgets = []
-        self._thumb_cache = OrderedDict()   # key: 截图文件名 -> QPixmap
-        self._thumb_queue = []              # 待加载 (index, filename, vertices)
+        self._thumb_cache = OrderedDict()   # key: (截图文件名, 顶点签名) -> QPixmap
+        self._thumb_queue = []              # 待加载 (index, filename, vertices_sig)
         self._thumb_queued = set()          # 去重：已在队列中的 index
 
         self._thumb_timer = QTimer(self)
@@ -548,41 +550,80 @@ class SideBarWidget(QWidget):
 
     # ---------- 缩略图 LRU 缓存 ----------
 
-    def _get_cached_thumb(self, filename):
-        if filename in self._thumb_cache:
-            self._thumb_cache.move_to_end(filename)
-            return self._thumb_cache[filename]
+    @staticmethod
+    def _vertices_signature(vertices):
+        """把 vertices 归一化为可哈希 tuple（区分 None / list / tuple / 嵌套）。
+
+        缓存键必须同时带文件名与顶点签名：截图文件名可被「重新拉框」复用而
+        框内容已变，只按文件名命中会把旧框缩略图贴到新框步骤上。
+        """
+        if vertices is None:
+            return None
+        if isinstance(vertices, (list, tuple)):
+            return tuple(SideBarWidget._vertices_signature(v) for v in vertices)
+        try:
+            hash(vertices)
+        except TypeError:
+            return repr(vertices)
+        return vertices
+
+    def _thumb_key(self, filename, vertices=None):
+        """缩略图缓存键：(文件名, 顶点签名)"""
+        return (filename, self._vertices_signature(vertices))
+
+    def _get_cached_thumb(self, key):
+        if key in self._thumb_cache:
+            self._thumb_cache.move_to_end(key)
+            return self._thumb_cache[key]
         return None
 
-    def _put_cached_thumb(self, filename, pixmap):
+    def _put_cached_thumb(self, key, pixmap):
+        filename = key[0] if isinstance(key, tuple) and key else None
         if not filename:
             return
-        self._thumb_cache[filename] = pixmap
-        self._thumb_cache.move_to_end(filename)
+        # 同一文件只保留最新签名的缩略图：旧签名键永久不可达，留着只会
+        # 让缓存无限膨胀，也会让「旧键是否命中」这类断言失去意义
+        for stale_key in [k for k in self._thumb_cache
+                          if isinstance(k, tuple) and k[0] == filename
+                          and k != key]:
+            self._thumb_cache.pop(stale_key, None)
+        self._thumb_cache[key] = pixmap
+        self._thumb_cache.move_to_end(key)
         while len(self._thumb_cache) > self.THUMB_CACHE_LIMIT:
             self._thumb_cache.popitem(last=False)
 
     def remove_thumb_cache_by_filename(self, filename):
-        """文件被删除或覆盖后移除缓存"""
-        self._thumb_cache.pop(filename, None)
+        """文件被删除或覆盖后移除该文件的全部缓存（含不同顶点签名）"""
+        for key in [k for k in self._thumb_cache
+                    if isinstance(k, tuple) and k[0] == filename]:
+            self._thumb_cache.pop(key, None)
 
     def invalidate_thumb(self, index):
-        """强制某步骤缩略图下次重新加载"""
+        """强制某步骤缩略图下次重新加载（按当前文件名+顶点签名精确失效）"""
         if 0 <= index < len(self.editor.steps_data):
-            filename = self.editor.steps_data[index].get("screenshot", "")
-            self.remove_thumb_cache_by_filename(filename)
+            step = self.editor.steps_data[index]
+            key = self._thumb_key(step.get("screenshot", ""), step.get("vertices"))
+            self._thumb_cache.pop(key, None)
 
     def request_thumb(self, index, high_priority=False):
-        """请求加载某步骤缩略图（懒加载、去重、可插队）"""
+        """请求加载某步骤缩略图（懒加载、去重、可插队）
+
+        high_priority 刷新会丢弃该下标此前排队的旧签名项，保证重拉框后的
+        新结果不会被仍在队列里的旧项覆盖。
+        """
         if not (0 <= index < len(self.editor.steps_data)):
             return
         step = self.editor.steps_data[index]
         filename = step.get("screenshot", "")
         if not filename:
             return
+        vertices_sig = self._vertices_signature(step.get("vertices"))
         if index in self._thumb_queued:
-            return
-        entry = (index, filename, step.get("vertices"))
+            if not high_priority:
+                return
+            self._thumb_queue = [e for e in self._thumb_queue if e[0] != index]
+            self._thumb_queued.discard(index)
+        entry = (index, filename, vertices_sig)
         self._thumb_queued.add(index)
         if high_priority:
             self._thumb_queue.insert(0, entry)
@@ -600,17 +641,27 @@ class SideBarWidget(QWidget):
         batch = self._thumb_queue[:self.THUMB_BATCH]
         self._thumb_queue = self._thumb_queue[self.THUMB_BATCH:]
 
-        for index, filename, vertices in batch:
+        for index, filename, vertices_sig in batch:
             self._thumb_queued.discard(index)
+            if not (0 <= index < len(self.editor.steps_data)):
+                continue
+            # 以执行时刻的模型为准：重拉框/重截图后，队列里的旧文件名或旧
+            # 顶点签名均已过期，直接丢弃，绝不写入缓存或贴到条目上
+            step = self.editor.steps_data[index]
+            if step.get("screenshot", "") != filename:
+                continue
+            if self._vertices_signature(step.get("vertices")) != vertices_sig:
+                continue
             if not (0 <= index < len(self.item_widgets)):
                 continue
-            pixmap = self._get_cached_thumb(filename)
+            key = (filename, vertices_sig)
+            pixmap = self._get_cached_thumb(key)
             if pixmap is None:
                 pixmap = self.editor.build_marked_preview(
-                    filename, vertices, StepListItemWidget.THUMB_SIZE
+                    filename, step.get("vertices"), StepListItemWidget.THUMB_SIZE
                 )
                 if pixmap is not None:
-                    self._put_cached_thumb(filename, pixmap)
+                    self._put_cached_thumb(key, pixmap)
             if 0 <= index < len(self.item_widgets):
                 self.item_widgets[index].set_thumbnail(pixmap)
 
@@ -723,6 +774,10 @@ class SideBarWidget(QWidget):
 
         self.jump_spin.setMaximum(max(1, total))
 
+        # 无已完成轮次时禁用回看入口（防止打开空对话框）
+        if hasattr(self.editor, "view_rounds_btn"):
+            self.editor.view_rounds_btn.setEnabled(bool(self.editor.rounds))
+
     def set_draft_saving(self):
         self.draft_time_label.setText("草稿：保存中…")
 
@@ -785,6 +840,216 @@ class ValidationFailDialog(QDialog):
 
     def target_index(self):
         return self._target_index
+
+
+class RoundPreviewDialog(QDialog):
+    """已完成轮次的只读回看器（不修改编辑器数据、不写草稿）"""
+
+    THUMB_SIZE = QSize(160, 90)
+    THUMB_BATCH = 20
+    CACHE_LIMIT = 128
+
+    def __init__(self, editor, parent=None):
+        super().__init__(parent)
+        self.editor = editor
+        self._rounds = editor.rounds if isinstance(editor.rounds, list) else []
+        self._items_meta = []       # [(filename, vertices)]，与列表行一一对应
+        self._pending = []          # 待生成缩略图的 (item, filename, vertices)
+        self._cache = OrderedDict()  # 独立 LRU：key=(filename, repr(vertices))
+
+        self.setWindowTitle("已完成轮次回看")
+        self.resize(980, 620)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        # ---- 顶部：轮次选择 ----
+        top = QHBoxLayout()
+        top.addWidget(QLabel("轮次："))
+        self.round_combo = QComboBox()
+        self.round_combo.setMinimumWidth(420)
+        for i, round_data in enumerate(self._rounds):
+            instruction = str(round_data.get("instruction", "") or "")
+            one_line = " ".join(instruction.split())
+            short = one_line[:30] + ("…" if len(one_line) > 30 else "")
+            self.round_combo.addItem(f"第 {i + 1} 轮 · {short or '（无指令）'}")
+            self.round_combo.setItemData(
+                i, f"第 {i + 1} 轮\n{instruction}", Qt.ToolTipRole
+            )
+        top.addWidget(self.round_combo, 1)
+        self.step_count_label = QLabel("共 0 步")
+        self.step_count_label.setStyleSheet("color: #546e7a;")
+        top.addWidget(self.step_count_label)
+        root.addLayout(top)
+
+        # ---- 中部：缩略图列表 + 大图预览 ----
+        body = QSplitter(Qt.Horizontal)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setViewMode(QListView.IconMode)
+        self.list_widget.setIconSize(self.THUMB_SIZE)
+        self.list_widget.setGridSize(QSize(170, 130))
+        self.list_widget.setResizeMode(QListView.Adjust)
+        self.list_widget.setMovement(QListView.Static)
+        self.list_widget.setSpacing(4)
+        self.list_widget.setWordWrap(True)
+        self.list_widget.currentRowChanged.connect(self._on_current_row_changed)
+        body.addWidget(self.list_widget)
+
+        self.preview_label = QLabel("请选择左侧步骤查看大图")
+        self.preview_label.setMinimumSize(480, 300)
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setStyleSheet(
+            "background-color: #263238; color: #cfd8dc; font-size: 14px;"
+        )
+        body.addWidget(self.preview_label)
+
+        body.setStretchFactor(0, 0)
+        body.setStretchFactor(1, 1)
+        body.setSizes([340, 640])
+        root.addWidget(body, 1)
+
+        # 缩略图分批生成定时器（10ms/批）
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setSingleShot(True)
+        self._thumb_timer.setInterval(10)
+        self._thumb_timer.timeout.connect(self._load_thumb_batch)
+
+        self.round_combo.currentIndexChanged.connect(self._load_round)
+        if self._rounds:
+            self._load_round(0)
+
+    # ---------- 数据读取（只读） ----------
+
+    def _round_coords(self, round_index):
+        """取某轮的 coords：优先 _coords_rounds，缺失时回退 rounds[i]['coords']"""
+        coords_rounds = getattr(self.editor, "_coords_rounds", None) or []
+        if len(coords_rounds) == len(self._rounds):
+            coords = coords_rounds[round_index]
+        else:
+            coords = (self._rounds[round_index] or {}).get("coords") or []
+        return coords if isinstance(coords, list) else []
+
+    def _round_vertices(self, round_index, step):
+        """按 step 从该轮 coords 中取合法 vertices；没有则返回 None（不画框）"""
+        entry = AnnotationEditor._find_coord_entry(
+            self._round_coords(round_index), step
+        )
+        if not isinstance(entry, dict):
+            return None
+        return AnnotationEditor._valid_vertices(entry.get("vertices"))
+
+    @staticmethod
+    def _trajectory_action_name(traj):
+        actions = (traj or {}).get("actions") or []
+        if isinstance(actions, list) and actions:
+            action = (actions[0] or {}).get("action", "")
+            if action:
+                return action_cn_name(action)
+        return "未知动作"
+
+    # ---------- 轮次切换与列表构建 ----------
+
+    def _load_round(self, round_index):
+        if not (0 <= round_index < len(self._rounds)):
+            return
+        self._thumb_timer.stop()
+        self._pending = []
+        self._items_meta = []
+        self.list_widget.clear()
+
+        trajectory = (self._rounds[round_index] or {}).get("trajectory") or []
+        if not isinstance(trajectory, list):
+            trajectory = []
+        self.step_count_label.setText(f"共 {len(trajectory)} 步")
+
+        placeholder = QPixmap(self.THUMB_SIZE)
+        placeholder.fill(QColor("#37474f"))
+
+        for i, traj in enumerate(trajectory):
+            traj = traj if isinstance(traj, dict) else {}
+            step = traj.get("step", i)
+            filename = (traj.get("observation") or {}).get("screenshot", "")
+            vertices = self._round_vertices(round_index, step)
+            action_text = self._trajectory_action_name(traj)
+            item = QListWidgetItem(
+                QIcon(placeholder), f"第 {int(step) + 1} 步 · {action_text}"
+            )
+            item.setToolTip(f"第 {int(step) + 1} 步 · {action_text}\n{filename}")
+            self.list_widget.addItem(item)
+            self._items_meta.append((filename, vertices))
+            self._pending.append((item, filename, vertices))
+
+        if self._pending:
+            self._thumb_timer.start(10)
+
+    def _load_thumb_batch(self):
+        """每批生成 THUMB_BATCH 张缩略图，全部完成后自动选中第 1 项"""
+        batch = self._pending[:self.THUMB_BATCH]
+        self._pending = self._pending[self.THUMB_BATCH:]
+        for item, filename, vertices in batch:
+            pixmap = self._thumb_pixmap(filename, vertices)
+            if pixmap is not None and not pixmap.isNull():
+                item.setIcon(QIcon(pixmap))
+        if self._pending:
+            self._thumb_timer.start(10)
+        else:
+            # 全部生成完毕再自动选中，避免大图反复重绘
+            if self.list_widget.count() > 0 and self.list_widget.currentRow() != 0:
+                self.list_widget.setCurrentRow(0)
+            elif self.list_widget.count() > 0:
+                self._refresh_preview()
+
+    # ---------- 独立缩略图 LRU（不触碰 SideBarWidget 缓存） ----------
+
+    def _cache_key(self, filename, vertices):
+        return (filename, repr(vertices))
+
+    def _thumb_pixmap(self, filename, vertices):
+        if not filename:
+            return None
+        key = self._cache_key(filename, vertices)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        pixmap = self.editor.build_marked_preview(
+            filename, vertices, self.THUMB_SIZE
+        )
+        if pixmap is not None and not pixmap.isNull():
+            self._cache[key] = pixmap
+            self._cache.move_to_end(key)
+            while len(self._cache) > self.CACHE_LIMIT:
+                self._cache.popitem(last=False)
+        return pixmap
+
+    # ---------- 大图预览 ----------
+
+    def _on_current_row_changed(self, row):
+        self._refresh_preview()
+
+    def _refresh_preview(self):
+        if not hasattr(self, "preview_label"):
+            return
+        row = self.list_widget.currentRow()
+        if not (0 <= row < len(self._items_meta)):
+            self.preview_label.clear()
+            self.preview_label.setText("请选择左侧步骤查看大图")
+            return
+        filename, vertices = self._items_meta[row]
+        size = self.preview_label.size()
+        target = QSize(max(480, size.width()), max(300, size.height()))
+        pixmap = self.editor.build_marked_preview(filename, vertices, target)
+        if pixmap is None or pixmap.isNull():
+            self.preview_label.clear()
+            self.preview_label.setText("截图文件缺失或无法加载")
+        else:
+            self.preview_label.setPixmap(pixmap)
+            self.preview_label.setText("")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_preview()
 
 
 class AnnotationEditor(QMainWindow):
@@ -985,6 +1250,12 @@ class AnnotationEditor(QMainWindow):
         self.btn_save_edit.clicked.connect(lambda: self.save_edited_round(False))
         self.btn_save_edit.hide()
         toolbar.addWidget(self.btn_save_edit)
+
+        # 只读回看已完成轮次（不修改任何数据；无已落轮时禁用）
+        self.view_rounds_btn = QPushButton("查看已完成轮次")
+        self.view_rounds_btn.setEnabled(False)
+        self.view_rounds_btn.clicked.connect(self.show_round_preview_dialog)
+        toolbar.addWidget(self.view_rounds_btn)
 
         toolbar.addStretch()
         main_layout.addLayout(toolbar)
@@ -1332,6 +1603,9 @@ class AnnotationEditor(QMainWindow):
 
     def start_capture(self):
         """给下一步截图：追加一个新步骤的截图（绝不覆盖当前步截图）"""
+        if self._final_data_saved and not self._edit_mode:
+            self.status_label.setText("任务已保存，请先选择是否开始新任务")
+            return
         if self._round_transition_pending:
             self.status_label.setText("轮次切换中，请稍候...")
             return
@@ -1401,6 +1675,9 @@ class AnnotationEditor(QMainWindow):
 
     def take_screenshot(self):
         """截取 iOS 屏幕（如同一步骤已有截图则替换）"""
+        if self._final_data_saved and not self._edit_mode:
+            self.status_label.setText("任务已保存，请先选择是否开始新任务")
+            return
         if self._round_transition_pending:
             self.status_label.setText("轮次切换中，请稍候...")
             return
@@ -2182,6 +2459,24 @@ class AnnotationEditor(QMainWindow):
                 QMessageBox.warning(self, "提示", "请先截图！")
             return
 
+        # 终止类动作必须是本轮最后一个步骤：answer/answer_terminate/terminate
+        # 会立即落轮或收尾，若后面还留着已落表步骤，这些步骤既不会被本次确认
+        # 提交，也不会进入下一轮，会在切轮/清空时静默丢失。
+        # current_step == len(steps_data) 的待确认空位不属于“后面还有步骤”，放行。
+        current_action = self._current_action_key()
+        if (
+            current_action in ("answer", "answer_terminate", "terminate")
+            and 0 <= self.current_step < len(self.steps_data) - 1
+        ):
+            remaining = len(self.steps_data) - 1 - self.current_step
+            QMessageBox.warning(
+                self, "提示",
+                f"「{action_cn_name(current_action)}」必须是本轮最后一个步骤。\n"
+                f"当前第 {self.current_step + 1} 步之后还有 {remaining} 个步骤，"
+                "请先删除或撤销这些步骤后再确认。"
+            )
+            return
+
         if not self._validate_step():
             return
 
@@ -2192,7 +2487,6 @@ class AnnotationEditor(QMainWindow):
         # 取消 swipe/scroll 测量状态
         self._cancel_swipe_measurement()
         self._cancel_scroll_measurement()
-        current_action = self._current_action_key()
 
         # answer 动作：保存当前轮次到 rounds 列表，然后开始新轮次（不结束任务）
         if current_action == "answer":
@@ -2450,6 +2744,12 @@ class AnnotationEditor(QMainWindow):
             return pixmap.scaled(
                 target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
+
+    def show_round_preview_dialog(self):
+        """工具栏入口：只读回看已完成轮次"""
+        if not self.rounds:
+            return
+        RoundPreviewDialog(self).exec_()
 
     # ========== 必填校验（支持任意下标，供侧栏缺项标记与结束前全量校验）==========
 
@@ -3603,6 +3903,10 @@ class AnnotationEditor(QMainWindow):
 
     def _finish_task(self):
         """完成当前任务，保存所有轮次数据并询问是否继续新任务"""
+        # 已完成并落盘后不得再次进入：弹窗/关闭窗口期间的重复确认会把已消费的
+        # rounds 再落一遍，或在 steps_data 已清空时写出空洞交付件
+        if self._final_data_saved:
+            return
         # 结束前全量必填校验（先把界面上的当前步落表），存在缺填项则弹窗拦截
         self._save_current_to_steps()
         missing_list = []
@@ -3647,6 +3951,11 @@ class AnnotationEditor(QMainWindow):
                 "请重新打开工具续采后再完成一次。"
             )
             return
+
+        # 已落盘：置完成标志，同时升门闩阻断弹窗/关闭期间的截图与确认，
+        # 避免“是否继续新任务”对话框尚未应答时又生成步骤或重复落盘
+        self._final_data_saved = True
+        self._round_transition_pending = True
 
         # 询问是否继续新任务
         reply = QMessageBox.question(
@@ -3889,6 +4198,10 @@ class AnnotationEditor(QMainWindow):
             self.gui_number = self.data_manager.get_next_gui_number()
             self.gui_dir = self.data_manager.create_gui_directory(self.gui_number)
             self._draft_discarded = False
+            # 新任务重新开放采集：清除上一任务的已完成标志与切轮门闩，
+            # 否则截图/确认入口会一直早退
+            self._final_data_saved = False
+            self._round_transition_pending = False
             self._missing_cache = []
             self._missing_live = None
             self._screenshot_missing = False

@@ -427,6 +427,10 @@ class InitTaskWindow(QMainWindow):
             self.annotation_window.task_instruction = new_instruction.strip()
             self.annotation_window.status_label.setText(
                 f"新任务开始 - 指令: {self.annotation_window.task_instruction}")
+        else:
+            # 取消：上一轮指令已随 answer/续采恢复被消费，必须清空并重置工作区，
+            # 否则用户接着采集的整轮会静默挂到旧指令上（B14）
+            self.annotation_window.cancel_next_round_instruction()
 
     def edit_completed_annotation(self):
         """编辑已完成任务：选择 gui_xxxxxx 目录 → 选轮次 → 打开编辑器编辑并写回原文件"""
