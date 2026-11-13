@@ -3508,7 +3508,10 @@ class AnnotationEditor(QMainWindow):
         self._edit_round_index = round_index
         self.current_round_index = round_index
         self._completed_json = copy.deepcopy(completed_data)
-        self._original_coords_exist = bool(coords_entries)
+        # 按 coords 文件盘上实际存在性判定（存在但内容为空也算存在）；
+        # 数据集不含 coords.json 是合法态，不能按载入条目是否为空判成「数据不一致」
+        coords_path = os.path.join(gui_dir or "", f"gui_{self.gui_number}_coords.json")
+        self._original_coords_exist = os.path.isfile(coords_path)
         self._coords_rounds = self._group_coords_by_round(self.rounds, coords_entries or [])
         self._edit_mode = True
         self._final_data_saved = False
@@ -3555,6 +3558,10 @@ class AnnotationEditor(QMainWindow):
                     current_coords, step_action, coordinate, start_coordinate, claimed_ids)
             rect_info, selection_type, coord_issue = self._classify_coord_state(
                 step_data, coord_entry)
+            if not self._original_coords_exist:
+                # 不含 coords.json 的数据集：不判 absent/mismatch、不告警，
+                # 坐标步按最终 JSON 显示 coordinate，允许在原图重新拉框
+                coord_issue = None
             if coord_issue in ("absent", "mismatch"):
                 action_cn = next((cn for cn, en in step_editor.action_type_mapping.items()
                                   if en == step_action), step_action or "")
@@ -3592,6 +3599,14 @@ class AnnotationEditor(QMainWindow):
                 + "\n\n这些步骤的框未载入，保存不会改动盘上原条目；"
                   "如需修复请在原图重新拉框，"
                   "或运行 tools/coords_center_repair.py 做中心对齐重建。"
+            )
+        elif not self._original_coords_exist:
+            # 缺失是合法态：仅一条信息性提示，不逐步告警、不追加状态栏警告
+            QMessageBox.information(
+                self,
+                "数据集不含 coords.json",
+                "该数据集不含 coords.json：编辑只更新最终 JSON，不会生成 coords.json；"
+                "拉框仅更新最终 JSON 的 coordinate。"
             )
 
         if self.steps:
@@ -3889,7 +3904,9 @@ class AnnotationEditor(QMainWindow):
                 if isinstance(entry, dict):
                     entry = {**entry, "round": group_index}
                 flat_coords.append(entry)
-        if flat_coords:
+        # 源数据集不含 coords.json → 无条件跳过写盘（即使本轮新拉了框），
+        # 拉框只更新最终 JSON 的 coordinate，绝不凭空生成 coords.json
+        if self._original_coords_exist and flat_coords:
             try:
                 self.data_manager.save_coords_json(flat_coords, self.gui_number)
             except Exception as e:

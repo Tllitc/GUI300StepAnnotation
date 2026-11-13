@@ -3509,7 +3509,12 @@ class AnnotationEditor(QMainWindow):
                           if 0 <= index < len(self.steps_data) else {})
                 inherited = (isinstance(stored, dict)
                              and stored.get("coord_issue") in ("absent", "mismatch"))
-                if not inherited:
+                # 源数据集不含 coords.json 时缺失是合法状态：坐标步按最终
+                # JSON 的 coordinate 校验，无框同样不算缺项。仅限编辑态：
+                # 正常采标态 _original_coords_exist 恒 False，拉框仍是必需
+                missing_coords_exempt = (self._edit_mode
+                                         and not self._original_coords_exist)
+                if not inherited and not missing_coords_exempt:
                     reasons.append("缺少拉框区域（请在 scrcpy 窗口右键拉框标注目标区域）")
             if action in START_END_ACTIONS:
                 if self._valid_coord_pair(data.get("start_coordinate")) is None:
@@ -4005,6 +4010,10 @@ class AnnotationEditor(QMainWindow):
                     coord_pair(action_data.get("start_coordinate")),
                     claimed_ids)
             vertices, coord_issue = self._classify_coord_state(action_data, coord_entry)
+            if not self._original_coords_exist:
+                # 源数据集本就不含 coords.json：缺失是合法状态，不判定
+                # absent/mismatch；坐标步按最终 JSON 显示 coordinate，允许重新拉框
+                coord_issue = None
             if coord_issue in ("absent", "mismatch"):
                 action_en = action_data.get("action", "-")
                 action_cn = next((label for value, label in ANDROID_ACTIONS
@@ -4067,6 +4076,14 @@ class AnnotationEditor(QMainWindow):
                 + "\n".join(lines)
                 + "\n\n这些步骤的框未载入，保存不会改动盘上原条目；"
                   "如需修复请在原图重新拉框。"
+            )
+        elif not self._original_coords_exist:
+            # 缺失是合法状态：只提示一次，不逐步告警、不追加状态栏告警
+            QMessageBox.information(
+                self,
+                "数据集不含 coords.json",
+                "该数据集不含 coords.json：编辑只更新最终 JSON，不会生成 coords.json；"
+                "拉框仅更新最终 JSON 的 coordinate。"
             )
 
         edit_status = (
@@ -4267,7 +4284,9 @@ class AnnotationEditor(QMainWindow):
         # 1.5（B41）coords 只在真的收集到条目时才写盘。旧条件带了
         # or self._original_coords_exist，会在「本轮导出 0 条坐标」时用空数组
         # 覆盖已交付的坐标文件；现在改为告警并跳过写入，保留原文件。
-        if all_coords:
+        # 源数据集不含 coords.json 时无条件跳过 coords 写盘（含新拉框），
+        # 拉框仅更新最终 JSON 的 coordinate；存在时保持 B41 口径不变。
+        if self._original_coords_exist and all_coords:
             self.data_manager.save_coords_json(all_coords, self.gui_number)
         elif self._original_coords_exist:
             print(

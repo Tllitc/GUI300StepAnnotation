@@ -30,8 +30,11 @@ def _write_png(path, index):
         f.write(FakeAndroidScreenCapture._render_png(index, 360, 640))
 
 
-def _build_dataset(base_dir):
+def _build_dataset(base_dir, with_coords_file=True):
     """在 base_dir 下构造两轮已完成数据集（coords 无 round 字段）
+
+    with_coords_file=False 时构造「不含 coords.json」的数据集：不写 coords
+    文件、返回空条目列表（默认行为不变），用于缺失合法态回归。
 
     :return: (gui_dir, data, coords_entries)
     """
@@ -91,9 +94,12 @@ def _build_dataset(base_dir):
     }
     with open(os.path.join(gui_dir, f"gui_{GUI_NUM}.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(gui_dir, f"gui_{GUI_NUM}_coords.json"), "w", encoding="utf-8") as f:
-        json.dump({"version": "3.0", "coords": coords_entries}, f,
-                  ensure_ascii=False, indent=2)
+    if with_coords_file:
+        with open(os.path.join(gui_dir, f"gui_{GUI_NUM}_coords.json"), "w", encoding="utf-8") as f:
+            json.dump({"version": "3.0", "coords": coords_entries}, f,
+                      ensure_ascii=False, indent=2)
+    else:
+        coords_entries = []
     return gui_dir, data, coords_entries
 
 
@@ -1177,3 +1183,156 @@ def test_merge_non_dict_falls_back_to_new_value():
     assert AnnotationEditor._is_empty_protected_value(0) is False
     assert AnnotationEditor._is_empty_protected_value("x") is False
     assert AnnotationEditor._is_empty_protected_value({"a": 1}) is False
+
+
+# ---------------------------------------------------------------------------
+# 源数据集不含 coords.json：缺失是合法状态（与 Windows 参考实现同口径）
+# ---------------------------------------------------------------------------
+
+def test_missing_coords_open_single_information_only(tmp_path, qapp, modal, monkeypatch):
+    """无 coords.json：打开只提示一次 information，不注册 absent/mismatch、
+    不弹逐步告警、不追加状态栏告警；坐标步按最终 JSON 显示 coordinate。"""
+    import annotation_editor
+
+    criticals = []
+    monkeypatch.setattr(
+        annotation_editor.QMessageBox, "critical",
+        lambda *a, **k: criticals.append(a[1:3]),
+    )
+
+    gui_dir, data, coords_entries = _build_dataset(tmp_path, with_coords_file=False)
+    assert coords_entries == []
+    assert not os.path.exists(os.path.join(gui_dir, f"gui_{GUI_NUM}_coords.json"))
+    editor = _load_editor(tmp_path, gui_dir, data, coords_entries, round_index=0)
+    try:
+        assert editor._original_coords_exist is False
+        assert editor._coord_issues == []
+        assert criticals == []
+        assert modal.warnings == []
+        assert len(modal.infos) == 1
+        title, text = modal.infos[0]
+        assert title == "数据集不含 coords.json"
+        assert "不会生成 coords.json" in text
+        assert "拉框仅更新最终 JSON 的 coordinate" in text
+        assert "⚠" not in editor.status_label.text()
+        # 坐标步无框预览、不带历史缺陷标记，coordinate 按最终 JSON 回填表单
+        assert editor.steps_data[0]["vertices"] is None
+        assert editor.steps_data[0]["coord_issue"] is None
+        assert editor.steps_data[0]["action_data"]["coordinate"] == [100, 200]
+        assert editor.coord_x_input.text() == "100"
+        assert editor.coord_y_input.text() == "200"
+        assert editor.btn_relabel.isHidden() is False
+        # 缺失合法态：无框不算缺项，不阻塞保存
+        assert editor.validate_step_at(0) == []
+    finally:
+        editor._edit_final_saved = True
+        editor.close()
+        flush_events(50)
+
+
+def test_missing_coords_text_only_save_no_coords_generated(tmp_path, qapp, modal):
+    """无 coords.json：仅改文本保存 → 最终 JSON 更新，绝不生成 coords.json。"""
+    gui_dir, data, coords_entries = _build_dataset(tmp_path, with_coords_file=False)
+    editor = _load_editor(tmp_path, gui_dir, data, coords_entries, round_index=0)
+    json_path = os.path.join(gui_dir, f"gui_{GUI_NUM}.json")
+    coords_path = os.path.join(gui_dir, f"gui_{GUI_NUM}_coords.json")
+    try:
+        editor.intent_input.setText("仅改文本后的意图")
+        assert editor.save_edited_round(False) is True
+        flush_events(50)
+    finally:
+        editor._edit_final_saved = True
+        try:
+            editor.close()
+        except Exception:
+            pass
+        flush_events(50)
+
+    saved = _read_json(json_path)
+    assert saved["messages"][1]["trajectory"][0]["intent"] == "仅改文本后的意图"
+    # 未编辑轮原样保留
+    assert saved["messages"][3] == data["messages"][3]
+    assert not os.path.exists(coords_path)
+
+
+def test_missing_coords_relabel_updates_coordinate_without_coords_file(tmp_path, qapp, modal):
+    """无 coords.json：新拉框保存 → 最终 JSON coordinate 更新为新框中心，
+    仍不生成 coords.json。"""
+    gui_dir, data, coords_entries = _build_dataset(tmp_path, with_coords_file=False)
+    editor = _load_editor(tmp_path, gui_dir, data, coords_entries, round_index=0)
+    json_path = os.path.join(gui_dir, f"gui_{GUI_NUM}.json")
+    coords_path = os.path.join(gui_dir, f"gui_{GUI_NUM}_coords.json")
+    try:
+        assert editor.steps_data[0]["action_data"]["coordinate"] == [100, 200]
+        # 重新拉框确认回调（与拉框弹窗 rect_drawn → apply 的信号路径等价）：
+        # 新框 [100, 200, 300, 400]，中心 (200, 300)
+        editor._on_relabel_rect(100, 200, 300, 400)
+        flush_events()
+        assert editor._current_vertices == [100, 200, 300, 400]
+        assert editor.coord_x_input.text() == "200"
+        assert editor.coord_y_input.text() == "300"
+        assert editor.save_edited_round(True) is True
+        flush_events(50)
+    finally:
+        editor._edit_final_saved = True
+        try:
+            editor.close()
+        except Exception:
+            pass
+        flush_events(50)
+
+    saved = _read_json(json_path)
+    assert saved["messages"][1]["trajectory"][0]["actions"][0]["coordinate"] == [200, 300]
+    assert not os.path.exists(coords_path)
+
+
+def test_missing_coords_close_silent_writeback(tmp_path, qapp, modal):
+    """无 coords.json：关闭自动静默写回（closeEvent → save_edited_round(silent=True)）
+    同样只更新最终 JSON，不生成 coords.json。"""
+    gui_dir, data, coords_entries = _build_dataset(tmp_path, with_coords_file=False)
+    editor = _load_editor(tmp_path, gui_dir, data, coords_entries, round_index=0)
+    json_path = os.path.join(gui_dir, f"gui_{GUI_NUM}.json")
+    coords_path = os.path.join(gui_dir, f"gui_{GUI_NUM}_coords.json")
+    editor.intent_input.setText("关闭前的修改")
+    editor.close()
+    flush_events(50)
+
+    saved = _read_json(json_path)
+    assert saved["messages"][1]["trajectory"][0]["intent"] == "关闭前的修改"
+    assert saved["messages"][3] == data["messages"][3]
+    assert not os.path.exists(coords_path)
+
+
+def test_empty_coords_file_exists_b41_preserved(tmp_path, qapp, modal, capsys):
+    """[] 空文件按存在处理：不弹缺失提示、absent 告警口径不变；
+    收集到 0 条坐标时 B41 跳过写盘，保留原文件。"""
+    gui_dir, data, coords_entries = _build_dataset(tmp_path)
+    coords_path = os.path.join(gui_dir, f"gui_{GUI_NUM}_coords.json")
+    with open(coords_path, "w", encoding="utf-8") as f:
+        json.dump([], f)
+    editor = _load_editor(tmp_path, gui_dir, data, [], round_index=0)
+    try:
+        assert editor._original_coords_exist is True
+        assert modal.infos == []
+        assert [issue for _, _, issue, _ in editor._coord_issues] == [
+            "absent", "absent", "absent"]
+        assert any(title == "coords 与坐标值不一致" for title, _ in modal.warnings)
+
+        capsys.readouterr()
+        # 本端 coords 收集对每步无条件 append（INV-7）：清空本轮步骤才能
+        # 复现「导出 0 条坐标」；同时清掉当前截图文件名，避免空表单被追加回步骤
+        editor.steps_data = []
+        editor._current_screenshot_filename = None
+        assert editor.save_edited_round(True) is True
+        flush_events(50)
+        out = capsys.readouterr().out
+        assert "已跳过 coords 写入以保留原文件" in out
+        assert os.path.exists(coords_path)
+        assert _read_json(coords_path) == []
+    finally:
+        editor._edit_final_saved = True
+        try:
+            editor.close()
+        except Exception:
+            pass
+        flush_events(50)

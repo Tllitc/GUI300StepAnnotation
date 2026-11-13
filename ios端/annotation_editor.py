@@ -2898,8 +2898,12 @@ class AnnotationEditor(QMainWindow):
         # _step_snapshot 只回五个键，必须回查 steps_data 才拿得到标记。
         stored = (self.steps_data[index]
                   if 0 <= index < len(self.steps_data) else {})
-        inherited_box_lost = (isinstance(stored, dict)
-                              and stored.get("coord_issue") in ("absent", "mismatch"))
+        # 源数据集不含 coords.json 时本就无框可载入，同样豁免「必须有框」，
+        # 否则仅改文本的正常保存会被挡住（拉框只更新最终 JSON 的 coordinate）
+        inherited_box_lost = (
+            (isinstance(stored, dict)
+             and stored.get("coord_issue") in ("absent", "mismatch"))
+            or (self._edit_mode and not self._original_coords_exist))
 
         # 坐标动作：需要 coordinate（scroll 同样要求先在首图拉框）
         if action in COORD_ACTIONS:
@@ -3335,6 +3339,10 @@ class AnnotationEditor(QMainWindow):
                         claimed_ids)
                 vertices, coord_issue = self._classify_coord_state(
                     action_data, coord_entry)
+                if not self._original_coords_exist:
+                    # 不含 coords.json 的数据集：不判 absent/mismatch、不告警，
+                    # 坐标步按最终 JSON 显示 coordinate，允许在原图重新拉框
+                    coord_issue = None
                 if coord_issue in ("absent", "mismatch"):
                     coord_issues.append((
                         i, action_cn_name(action_data.get("action")), coord_issue,
@@ -3396,6 +3404,14 @@ class AnnotationEditor(QMainWindow):
                 + "\n".join(lines)
                 + "\n\n这些步骤的框未载入，保存不会改动盘上原条目；"
                   "如需修复请在原图重新拉框。"
+            )
+        elif not self._original_coords_exist:
+            # 缺失是合法态：仅一条信息性提示，不逐步告警、不追加状态栏警告
+            QMessageBox.information(
+                self,
+                "数据集不含 coords.json",
+                "该数据集不含 coords.json：编辑只更新最终 JSON，不会生成 coords.json；"
+                "拉框仅更新最终 JSON 的 coordinate。"
             )
         edit_status = f"编辑已完成任务 gui_{self.gui_number} · 第 {round_index + 1} 轮"
         if self._coord_issues:
@@ -3667,7 +3683,9 @@ class AnnotationEditor(QMainWindow):
         # 1.5（B41）coords 只在真的收集到条目时才写盘。旧条件带了
         # or self._original_coords_exist，会在「本轮导出 0 条坐标」时用空数组
         # 覆盖已交付的坐标文件；现在改为告警并跳过写入，保留原文件。
-        if all_coords:
+        # 源数据集不含 coords.json → 无条件跳过写盘（即使本轮新拉了框），
+        # 拉框只更新最终 JSON 的 coordinate，绝不凭空生成 coords.json
+        if self._original_coords_exist and all_coords:
             self.data_manager.save_coords_json(all_coords, self.gui_number)
         elif self._original_coords_exist:
             print(
