@@ -335,7 +335,7 @@ def test_scroll_blocks_append_but_recapture_goes_extra(editor):
 
 def test_toolbar_and_shortcuts(editor, editor_factory, monkeypatch):
     """两个按钮的文案/配色、画布占位文案与 Ctrl+Q / Ctrl+S 路由。"""
-    assert editor.btn_recapture.text() == "重新截图"
+    assert editor.btn_recapture.text() == "重新截图 (Ctrl+R)"
     assert "#FF9800" in editor.btn_recapture.styleSheet(), "「重新截图」应为橙色"
     assert editor.btn_capture_next.text() == "给下一步截图 (Ctrl+Q)"
     assert "#2196F3" in editor.btn_capture_next.styleSheet(), (

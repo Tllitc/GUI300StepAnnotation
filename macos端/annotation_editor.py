@@ -1752,7 +1752,7 @@ class AnnotationEditor(QMainWindow):
         self.insert_step_btn.setEnabled(False)
         toolbar.addWidget(self.insert_step_btn)
 
-        recapture_btn = QPushButton("重新截图")
+        recapture_btn = QPushButton("重新截图 (Control+R)")
         recapture_btn.setStyleSheet("QPushButton { background-color: #FF9800; color: white; }")
         recapture_btn.clicked.connect(self.recapture_current_step)
         toolbar.addWidget(recapture_btn)
@@ -1823,6 +1823,11 @@ class AnnotationEditor(QMainWindow):
         self.next_shortcut = QShortcut(QKeySequence(Qt.Key_PageDown), self)
         self.next_shortcut.setContext(Qt.WindowShortcut)
         self.next_shortcut.activated.connect(self.next_step)
+        # 重新截图快捷键：与 Control+Q 同口径用物理 Control 键
+        # （macOS 上 Qt 的 Ctrl 映射为 Cmd，物理 Control 须用 Meta）
+        self.recapture_shortcut = QShortcut(QKeySequence("Meta+R"), self)
+        self.recapture_shortcut.setContext(Qt.WindowShortcut)
+        self.recapture_shortcut.activated.connect(self.recapture_current_step)
 
         # 多轮任务支持
         self.rounds = []  # 存储所有轮次的数据
@@ -3799,7 +3804,8 @@ class AnnotationEditor(QMainWindow):
         - 其余键：new 有的以 new 为准；original 有而 new 缺失的键深拷贝保留。
         - actions[0] 缺失键补齐：动作类型变更（按已序列化的 action 值比较）时
           不补齐旧动作的已知参数键（_ACTION_PARAM_KEYS），避免旧动作参数连同
-          旧值复活进新动作；未知键仍照常保留。同类型时补齐行为不变。
+          旧值复活进新动作；status 为终止类动作专属，一律不补齐进非终止新动作
+          （不论动作类型是否变更）；未知键仍照常保留。同类型时补齐行为不变。
         返回新 dict，不原地修改入参。
         """
         if not isinstance(original_step, dict):
@@ -3859,9 +3865,13 @@ class AnnotationEditor(QMainWindow):
             # 动作类型变更时，旧动作的已知参数键属于旧动作（get_data 已按新动作
             # 正确省略），不得连同旧值补齐复活；未知键仍照常保留
             action_changed = new_actions[0].get("action") != old_actions[0].get("action")
+            new_is_terminal = new_actions[0].get("action") in self._TERMINAL_ACTIONS
             for key, old_value in old_actions[0].items():
                 if key not in new_actions[0]:
                     if action_changed and key in self._ACTION_PARAM_KEYS:
+                        continue
+                    # status 为终止类动作专属：非终止新动作一律不补齐
+                    if key == "status" and not new_is_terminal:
                         continue
                     new_actions[0][key] = copy.deepcopy(old_value)
 

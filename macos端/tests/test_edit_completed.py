@@ -197,8 +197,8 @@ def test_save_edited_round0_only_replaces_round0(editor):
     saved = H.read_final_json(editor)
     assert saved["messages"][0] == original["messages"][0]
     assert saved["messages"][1]["trajectory"][0]["intent"] == "修改后的意图"
-    # 未暴露字段（status / element）保留
-    assert saved["messages"][1]["trajectory"][0]["actions"][0]["status"] == "success"
+    # 未暴露字段 element 保留；status 为终止类专属，不补齐进非终止动作
+    assert "status" not in saved["messages"][1]["trajectory"][0]["actions"][0]
     assert saved["messages"][1]["trajectory"][0]["actions"][0]["element"] == "按钮"
     # 其它轮次与顶层字段逐字段不变
     assert saved["messages"][2] == original["messages"][2]
@@ -340,7 +340,8 @@ def test_edit_completed_intent_only_change_keeps_protected_and_unknown_keys(edit
     _assert_downstream_fields_preserved(
         saved_step, "下游CoT", "下游窗口", "下游UI树片段")
     assert saved_step["actions"][0]["element"] == "下游元素"
-    assert saved_step["actions"][0]["status"] == "success"
+    # status 为终止类专属：left_click 合并后不得携带 status
+    assert "status" not in saved_step["actions"][0]
     assert saved_step["extra_step_key"] == {"a": 1}
     assert saved_step["observation"]["extra_obs_key"] == "keep"
     assert saved_step["actions"][0]["extra_action_key"] == [1, 2]
@@ -671,9 +672,9 @@ def test_merge_type_to_left_click_drops_old_text(editor):
     assert action["action"] == "left_click"
     assert "text" not in action
     assert action["coordinate"] == [200, 300]
-    # 非参数键的保留规则不受影响：element 空值回退、status 缺失补齐
+    # 非参数键的保留规则不受影响：element 空值回退；status 为终止类专属，不补齐
     assert action["element"] == "输入框"
-    assert action["status"] == "success"
+    assert "status" not in action
 
 
 def test_merge_drag_to_left_click_drops_old_start_coordinate(editor):
@@ -815,9 +816,9 @@ def test_merge_action_change_keeps_protected_empty_fallback(editor):
     assert merged["CoT"] == "原始推理链，禁止被空值覆盖"
     assert merged["observation"]["active_window"] == "原始窗口标题"
     assert merged["observation"]["ui_tree_segment"] == "<node>原始 UI 树片段</node>"
-    # 非终止动作 element/status：空值回退 / 缺失补齐
+    # 非终止动作 element：空值回退；status 为终止类专属，不补齐
     assert action["element"] == "原始按钮"
-    assert action["status"] == "success"
+    assert "status" not in action
     # 步骤级未知键照常保留
     assert merged["downstream_meta"] == {"x": 1, "nested": ["a", "b"]}
     # 但旧动作参数键不补齐
@@ -847,7 +848,8 @@ def test_merge_same_action_still_backfills_missing_keys(editor):
     assert action["coordinate"] == [200, 300]
     assert action["foo"] == "bar"
     assert action["element"] == "新按钮"
-    assert action["status"] == "success"
+    # status 为终止类专属：同类型补齐也不得把 status 带进非终止动作
+    assert "status" not in action
 
 
 def test_merge_answer_same_serialized_type_backfills_text(editor):
@@ -938,4 +940,62 @@ def test_edit_completed_change_type_to_click_silent_writeback(editor):
     assert saved_action["action"] == "left_click"
     assert "text" not in saved_action
     assert saved_action["coordinate"] == [200, 300]
+    I.assert_final_json(editor, expected_rounds=1)
+
+
+def test_merge_terminate_to_left_click_drops_status(editor):
+    """terminate(status="success")→left_click：status 为终止类动作专属，
+    不得补齐进非终止新动作；element 空值回退等其余规则不受影响。"""
+    gui = editor.gui_number
+    shot = f"gui_{gui}_0001.png"
+    old_step = _rich_step(gui, shot, {
+        "action": "terminate",
+        "element": "残留元素",
+        "status": "success",
+    })
+    # get_data() 对 left_click 的产物形态：action/element/coordinate，无 status
+    new_step = _rebuilt_step({
+        "action": "left_click",
+        "coordinate": [200, 300],
+        "element": "",
+    }, shot)
+
+    merged = editor._merge_step_with_original(new_step, old_step)
+    action = merged["actions"][0]
+    assert action["action"] == "left_click"
+    assert "status" not in action
+    assert action["coordinate"] == [200, 300]
+    # element 空值回退 / 受保护字段 / 未知键等其余规则不受影响
+    assert action["element"] == "残留元素"
+    assert merged["CoT"] == "原始推理链，禁止被空值覆盖"
+    assert merged["observation"]["ui_tree_segment"] == "<node>原始 UI 树片段</node>"
+    assert merged["downstream_meta"] == {"x": 1, "nested": ["a", "b"]}
+
+
+@pytest.mark.parametrize("silent", [False, True])
+def test_edit_completed_terminate_to_click_drops_status(editor, silent):
+    """端到端：已完成 JSON 的 terminate 步改为 left_click（重新拉框填坐标），
+    写回（silent 参数化）后该步 actions[0] 不得携带旧 status。"""
+    gui = editor.gui_number
+    data = _regression_single_round(gui, {
+        "action": "terminate",
+        "element": "",
+        "status": "success",
+    })
+    gui_dir = _write_dataset(editor, data, [])
+    _write_dataset_shots(gui_dir, data)
+    H.open_edit_mode(editor, gui_dir, 0)
+
+    # terminate 无坐标：先在原图上重新拉框 (400, 500, 200, 100) → 中心 (500, 550)
+    H.relabel_rect(editor, 0, rect=(400, 500, 200, 100), selection_type="click")
+    H.fill_step(editor, 0, action_chinese="左键单击", intent="改为点击",
+                coord_text="500,550")
+    assert editor.save_edited_round(silent=silent) is True
+
+    # ⚠ silent=False 保存成功后产品会 close() + deleteLater()：此处起不得再推进
+    # 事件循环，后续只读纯 Python / 磁盘
+    saved_action = H.read_final_json(editor)["messages"][1]["trajectory"][0]["actions"][0]
+    assert saved_action["action"] == "left_click"
+    assert "status" not in saved_action
+    assert saved_action["coordinate"] == [500, 550]
     I.assert_final_json(editor, expected_rounds=1)

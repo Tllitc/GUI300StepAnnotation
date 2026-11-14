@@ -129,6 +129,19 @@ def _capture_extra_for_scroll(editor, ref_rect):
 # 6.1 历史步重新截图：序号不变、内容更新、旁步不受影响、缩略图反映新图
 # ----------------------------------------------------------------------
 
+def test_recapture_shortcut_ctrl_r(editor_factory, monkeypatch):
+    """Ctrl+R 经 keyPressEvent 触发 recapture_current_step。"""
+    from PyQt5.QtCore import Qt
+    import annotation_editor as ae
+
+    calls = []
+    monkeypatch.setattr(ae.AnnotationEditor, "recapture_current_step",
+                        lambda self: calls.append(1))
+    editor = editor_factory()
+    QTest.keyClick(editor, Qt.Key_R, Qt.ControlModifier)
+    assert calls == [1], "Ctrl+R 未触发 recapture_current_step"
+
+
 def test_recapture_history_step_keeps_number_updates_content(editor, qapp):
     """display_step 回历史步后走真实“截图”入口重新截图（替换截图分支）。"""
     walk_steps(editor, 3, action="click")

@@ -1767,6 +1767,12 @@ class AnnotationEditor(QMainWindow):
         sc_screenshot.setAutoRepeat(False)
         sc_screenshot.activated.connect(self.take_screenshot)
 
+        # 重新截图：本端无独立重截入口，take_screenshot 在历史步上即原地重截
+        sc_recapture = QShortcut(QKeySequence("Ctrl+R"), self)
+        sc_recapture.setContext(Qt.ApplicationShortcut)
+        sc_recapture.setAutoRepeat(False)
+        sc_recapture.activated.connect(self.take_screenshot)
+
         sc_next = QShortcut(QKeySequence("Ctrl+S"), self)
         sc_next.setContext(Qt.ApplicationShortcut)
         sc_next.activated.connect(self.go_next)
@@ -3880,6 +3886,8 @@ class AnnotationEditor(QMainWindow):
         "coordinate", "start_coordinate", "text", "keys",
         "time", "pixels", "buttons",
     }
+    # 终止类动作：status 为其专属字段，非终止新动作不得经缺失键补齐获得 status
+    _TERMINAL_ACTIONS = ("terminate", "answer", "answer_terminate")
 
     @staticmethod
     def _is_empty_protected_value(value):
@@ -3912,8 +3920,11 @@ class AnnotationEditor(QMainWindow):
           （如 observation）的递归调用传播。actions 列表按位置合并时，若
           新旧元素的动作类型（字典中已序列化的 action 值，answer_terminate
           记为 answer，故 answer↔answer_terminate 视为同类型）不同，则以
-          _ACTION_PARAM_KEYS 传入：旧动作的参数键不再补进新动作；未知键
-          与受保护键的保留/回退规则不受影响。
+          _ACTION_PARAM_KEYS 传入：旧动作的参数键不再补进新动作；此外
+          status 是终止类动作（_TERMINAL_ACTIONS）专属字段，只要新元素
+          动作是非终止类，无论动作类型是否变更，都追加跳过 "status"，
+          旧 status 不得经缺失键补齐复活进非终止动作；未知键与受保护键
+          的保留/回退规则不受影响。
         """
         if isinstance(new, dict) and isinstance(old, dict):
             merged = copy.deepcopy(new)
@@ -3947,6 +3958,10 @@ class AnnotationEditor(QMainWindow):
                             and merged[i].get("action") != old_item.get("action")):
                         # 动作类型已变更：旧动作的参数键不得复活进新动作
                         skip_missing = cls._ACTION_PARAM_KEYS
+                    if (isinstance(merged[i], dict)
+                            and merged[i].get("action") not in cls._TERMINAL_ACTIONS):
+                        # status 为终止类动作专属：非终止新动作一律不补齐旧 status
+                        skip_missing = set(skip_missing) | {"status"}
                     merged[i] = cls._merge_missing_keys(
                         merged[i], old_item, cls._PROTECTED_ACTION_KEYS,
                         skip_missing_keys=skip_missing)

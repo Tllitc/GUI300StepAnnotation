@@ -27,6 +27,30 @@ def test_smoke_three_steps(editor):
     I.assert_final_json(editor, expected_rounds=1)
 
 
+def test_recapture_shortcut_ctrl_r(editor_factory, monkeypatch):
+    """重新截图快捷键触发 recapture_current_step。
+
+    产品侧绑定 Meta+R：macOS 上 Qt 的 Meta 即物理 Control 键（与 Control+Q
+    同口径）；测试宿主为 Windows，故此处以 Meta 修饰键派发验证接线。
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtTest import QTest
+    import annotation_editor as ae
+
+    calls = []
+    monkeypatch.setattr(ae.AnnotationEditor, "recapture_current_step",
+                        lambda self: calls.append(1))
+    editor = editor_factory()
+    sc = editor.recapture_shortcut
+    assert sc.key().toString() == "Meta+R"
+    assert sc.context() == Qt.WindowShortcut
+    editor.show()
+    editor.activateWindow()
+    QTest.qWait(20)
+    QTest.keyClick(editor, Qt.Key_R, Qt.MetaModifier)
+    assert calls == [1], "Control+R（Meta+R）未触发 recapture_current_step"
+
+
 def test_undo_last_step_basic(editor):
     """撤销末尾一步：3→2，文件删除，侧栏减少，当前下标正确。"""
     H.walk_steps(editor, 3, action_chinese="左键单击")

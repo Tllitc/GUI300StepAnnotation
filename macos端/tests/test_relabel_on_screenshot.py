@@ -220,8 +220,8 @@ def test_relabel_writeback_to_json_and_coords(editor, monkeypatch):
     saved = H.read_final_json(editor)
     action0 = saved["messages"][1]["trajectory"][0]["actions"][0]
     assert action0["coordinate"] == [500, 350]
-    # 未暴露字段与其它轮次原样保留（INV-13）
-    assert action0["status"] == "success"
+    # 未暴露字段与其它轮次原样保留（INV-13）；status 为终止类专属，不补齐进非终止动作
+    assert "status" not in action0
     assert action0["element"] == "按钮"
     I.assert_edit_writeback_preserved(
         gui_dir, editor.gui_number,

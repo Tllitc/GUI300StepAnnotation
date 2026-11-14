@@ -30,6 +30,28 @@ def _png_names(gui_dir):
     return sorted(n for n in os.listdir(gui_dir) if n.endswith(".png"))
 
 
+def test_recapture_shortcut_ctrl_r(editor_factory, monkeypatch):
+    """Ctrl+R 绑定截图入口（本端历史步上截图即原地重截）。"""
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtTest import QTest
+    from PyQt5.QtWidgets import QShortcut
+    import annotation_editor as ae
+
+    calls = []
+    monkeypatch.setattr(ae.AnnotationEditor, "take_screenshot",
+                        lambda self: calls.append(1))
+    editor = editor_factory()
+    scs = [s for s in editor.findChildren(QShortcut)
+           if s.key().toString() == "Ctrl+R"]
+    assert len(scs) == 1, "应恰好注册一个 Ctrl+R 快捷键"
+    assert scs[0].context() == Qt.ApplicationShortcut
+    editor.show()
+    editor.activateWindow()
+    QTest.qWait(20)
+    QTest.keyClick(editor, Qt.Key_R, Qt.ControlModifier)
+    assert calls == [1], "Ctrl+R 未触发 take_screenshot"
+
+
 # ---------- SubTask 6.1：中间步重新截图 ----------
 
 def test_6_1_recapture_middle_step(editor_factory):

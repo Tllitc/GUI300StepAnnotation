@@ -149,9 +149,10 @@ def test_edit_mode_capture_next_confirm_then_save_round(
     assert traj[2]["intent"] == "新增步"
     assert traj[2]["observation"]["screenshot"] == new_name
     assert traj[2]["actions"][0]["coordinate"] == [100, 250]
-    # 原步受保护字段不被空值覆盖
+    # 原步受保护字段不被空值覆盖；status 为终止类动作专属，
+    # type 新动作不含 status 键，旧 status 不被补齐
     assert traj[0]["observation"]["note"] == "round0-step0"
-    assert traj[0]["actions"][0]["status"] == "success"
+    assert "status" not in traj[0]["actions"][0]
     assert traj[1] == data["messages"][1]["trajectory"][1]
     # 其余轮次逐字不变
     assert saved["messages"][3] == data["messages"][3]

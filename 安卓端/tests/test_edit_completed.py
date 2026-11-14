@@ -514,7 +514,8 @@ def test_missing_fields_block_save_without_touching_json(tmp_path, qapp, modal):
 
 # ----------------------------------------------------------------------
 # 9. 已完成轮次编辑：受保护字段（CoT / active_window / ui_tree_segment /
-#    element / status）与未知键保留，被编辑字段为新值，原始数据不被污染
+#    element）与未知键保留，被编辑字段为新值，原始数据不被污染；
+#    status 为终止类动作专属，非终止新动作不补齐
 # ----------------------------------------------------------------------
 
 def _build_protected_dataset(base_dir):
@@ -618,12 +619,13 @@ def test_save_edited_round_keeps_protected_fields_and_unknown_keys(tmp_path, qap
     traj = saved["messages"][1]["trajectory"]
     first = traj[0]
 
-    # 受保护字段原样保留
+    # 受保护字段原样保留；status 是终止类动作专属，click 新动作不含
+    # status 键，旧 status 不被补齐
     assert first["CoT"] == "下游已填的思维链"
     assert first["observation"]["active_window"] == "设置主页"
     assert first["observation"]["ui_tree_segment"] == {"nodes": ["a", "b"]}
     assert first["actions"][0]["element"] == "设置图标"
-    assert first["actions"][0]["status"] == "success"
+    assert "status" not in first["actions"][0]
     # 未知键（步骤层 / observation 层 / action 层）保留
     assert first["unknown_step_key"] == "保留我"
     assert first["observation"]["unknown_obs_key"] == 42
@@ -1423,7 +1425,8 @@ def test_merge_action_change_keeps_unknown_action_keys():
 
 
 def test_merge_action_change_keeps_protected_fallback():
-    """动作变更时受保护字段空值回退规则不变（CoT/observation/element/status）。"""
+    """动作变更时受保护字段空值回退规则不变（CoT/observation/element）；
+    status 为终止类动作专属，新动作非终止且无 status 键时不补齐。"""
     merged = _merge_traj_pair(
         {"action": "click", "coordinate": [160, 310], "element": ""},
         {"action": "type", "coordinate": [150, 250], "text": "abc",
@@ -1432,7 +1435,7 @@ def test_merge_action_change_keeps_protected_fallback():
     action = merged["actions"][0]
     assert "text" not in action
     assert action["element"] == "输入框"
-    assert action["status"] == "success"
+    assert "status" not in action
     assert merged["CoT"] == "下游已填的思维链"
     assert merged["observation"]["active_window"] == "旧窗口"
     assert merged["observation"]["ui_tree_segment"] == {"nodes": ["old"]}
@@ -1475,6 +1478,22 @@ def test_merge_answer_terminate_serialized_as_same_type():
     assert merged["actions"][0]["text"] == "旧答案"
 
 
+def test_merge_terminate_to_click_drops_status():
+    """回归：terminate 改为 click 后，旧 status 不得经缺失键补齐复活。
+
+    新动作取 _build_action_data 产物形态（action/element/coordinate，
+    无 status 键）；status 是终止类动作专属，click 结果不应含该键。
+    """
+    merged = _merge_traj_pair(
+        {"action": "click", "element": "", "coordinate": [160, 310]},
+        {"action": "terminate", "element": "", "status": "success"},
+    )
+    action = merged["actions"][0]
+    assert action["action"] == "click"
+    assert "status" not in action
+    assert action["coordinate"] == [160, 310]
+
+
 @pytest.mark.parametrize("silent", [False, True], ids=["normal", "silent"])
 def test_save_edited_round_type_to_click_drops_stale_text(
         tmp_path, qapp, modal, silent):
@@ -1513,3 +1532,41 @@ def test_save_edited_round_type_to_click_drops_stale_text(
     assert action["coordinate"] == [160, 310]
     # 未编辑轮不受影响
     assert saved["messages"][3] == data["messages"][3]
+
+
+def test_save_edited_round_terminate_to_click_drops_status(tmp_path, qapp, modal):
+    """端到端：terminate 步改为 click（重新拉框填坐标）保存后，
+    交付 JSON 该步 actions[0] 不得含 status 键。"""
+    gui_dir, data, coords_entries = _build_terminate_dataset(tmp_path)
+    editor = _load_editor(tmp_path, gui_dir, data, coords_entries, round_index=0)
+    json_path = os.path.join(gui_dir, f"gui_{GUI_NUM}.json")
+    try:
+        assert editor.steps_data[0]["action_data"]["action"] == "terminate"
+        assert editor.steps_data[0]["action_data"]["status"] == "success"
+
+        # 动作改为 click；terminate 原无拉框，走真实[重新拉框]入口的
+        # 落表回调，提供 vertices 与坐标（新框中心 150,250）
+        editor.action_combo.setCurrentIndex(
+            editor.action_combo.findData("click"))
+        editor._on_relabel_rect(100, 200, 200, 300)
+        flush_events()
+        editor.confirm_step()
+        flush_events()
+
+        assert editor.save_edited_round(False) is True
+        flush_events(50)
+    finally:
+        editor._edit_final_saved = True
+        try:
+            editor.close()
+        except Exception:
+            pass
+        flush_events(50)
+
+    saved = _read_json(json_path)
+    action = saved["messages"][1]["trajectory"][0]["actions"][0]
+    assert action["action"] == "click"
+    assert "status" not in action
+    assert action["coordinate"] == [150, 250]
+    # 同轮 answer 步不受影响（终止类 status 保留）
+    assert saved["messages"][1]["trajectory"][1] == data["messages"][1]["trajectory"][1]
