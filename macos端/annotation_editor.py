@@ -3773,6 +3773,8 @@ class AnnotationEditor(QMainWindow):
     _PROTECTED_STEP_FIELDS = ("CoT",)
     _PROTECTED_OBSERVATION_FIELDS = ("active_window", "ui_tree_segment")
     _PROTECTED_ACTION_FIELDS = ("element", "status")
+    # 各动作类型的已知参数键：动作类型变更时这些键属于旧动作，不得补齐进新动作
+    _ACTION_PARAM_KEYS = {"coordinate", "start_coordinate", "text", "keys", "time", "pixels", "buttons"}
     _TERMINAL_ACTIONS = ("terminate", "answer", "answer_terminate")
 
     @staticmethod
@@ -3795,6 +3797,9 @@ class AnnotationEditor(QMainWindow):
         - 终止类动作（terminate / answer / answer_terminate）保持业务规则：
           element 恒为 ""、status 恒为 "success"，不做保留合并。
         - 其余键：new 有的以 new 为准；original 有而 new 缺失的键深拷贝保留。
+        - actions[0] 缺失键补齐：动作类型变更（按已序列化的 action 值比较）时
+          不补齐旧动作的已知参数键（_ACTION_PARAM_KEYS），避免旧动作参数连同
+          旧值复活进新动作；未知键仍照常保留。同类型时补齐行为不变。
         返回新 dict，不原地修改入参。
         """
         if not isinstance(original_step, dict):
@@ -3851,8 +3856,13 @@ class AnnotationEditor(QMainWindow):
         if isinstance(new_actions, list) and isinstance(old_actions, list) \
                 and new_actions and isinstance(new_actions[0], dict) \
                 and len(old_actions) > 0 and isinstance(old_actions[0], dict):
+            # 动作类型变更时，旧动作的已知参数键属于旧动作（get_data 已按新动作
+            # 正确省略），不得连同旧值补齐复活；未知键仍照常保留
+            action_changed = new_actions[0].get("action") != old_actions[0].get("action")
             for key, old_value in old_actions[0].items():
                 if key not in new_actions[0]:
+                    if action_changed and key in self._ACTION_PARAM_KEYS:
+                        continue
                     new_actions[0][key] = copy.deepcopy(old_value)
 
         return merged

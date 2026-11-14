@@ -13,6 +13,7 @@ import copy
 import json
 import os
 
+import pytest
 from PyQt5.QtTest import QTest
 
 from annotation_editor import AnnotationEditor
@@ -1336,3 +1337,179 @@ def test_empty_coords_file_exists_b41_preserved(tmp_path, qapp, modal, capsys):
         except Exception:
             pass
         flush_events(50)
+
+
+# ----------------------------------------------------------------------
+# 14. 动作类型变更：旧动作参数键（coordinate/start_coordinate/text/keys/
+#     time/pixels/buttons）不得被合并复活；未知键与受保护字段空值回退不受影响
+# ----------------------------------------------------------------------
+
+def _merge_traj_pair(new_action, old_action):
+    """按 save_edited_round 的实际调用形态合并：new_traj 整体 vs original。
+
+    步骤级周边字段取「新值为空 / 旧值非空」形态，顺带回归受保护字段回退。
+    """
+    editor = _bare_editor()
+    old = {
+        "step": 0,
+        "intent": "旧意图",
+        "CoT": "下游已填的思维链",
+        "observation": {
+            "screenshot": "gui_000001_0001.png",
+            "active_window": "旧窗口",
+            "ui_tree_segment": {"nodes": ["old"]},
+        },
+        "actions": [copy.deepcopy(old_action)],
+    }
+    new = {
+        "step": 0,
+        "intent": "新意图",
+        "CoT": "",
+        "observation": {
+            "screenshot": "gui_000001_0001.png",
+            "active_window": "",
+            "ui_tree_segment": "",
+        },
+        "actions": [copy.deepcopy(new_action)],
+    }
+    return editor._merge_missing_keys(
+        new, old, AnnotationEditor._PROTECTED_STEP_KEYS)
+
+
+@pytest.mark.parametrize(
+    "old_action, new_action, stale_key",
+    [
+        ({"action": "type", "coordinate": [150, 250], "text": "abc"},
+         {"action": "click", "coordinate": [160, 310]}, "text"),
+        ({"action": "swipe", "start_coordinate": [10, 20],
+          "coordinate": [30, 40]},
+         {"action": "click", "coordinate": [50, 60]}, "start_coordinate"),
+        ({"action": "drag", "start_coordinate": [10, 20],
+          "coordinate": [30, 40]},
+         {"action": "click", "coordinate": [50, 60]}, "start_coordinate"),
+        ({"action": "click", "coordinate": [100, 250]},
+         {"action": "wait", "time": 1.5}, "coordinate"),
+        ({"action": "scroll", "coordinate": [120, 300], "pixels": -120},
+         {"action": "click", "coordinate": [310, 410]}, "pixels"),
+        ({"action": "system_button", "buttons": ["Home"]},
+         {"action": "click", "coordinate": [5, 6]}, "buttons"),
+        ({"action": "key", "keys": ["ctrl", "a"]},
+         {"action": "click", "coordinate": [7, 8]}, "keys"),
+    ],
+    ids=["type->click", "swipe->click", "drag->click", "click->wait",
+         "scroll->click", "system_button->click", "key->click"],
+)
+def test_merge_action_change_drops_stale_param_keys(
+        old_action, new_action, stale_key):
+    """动作类型变更后，旧动作的参数键不得补进新动作（新动作自身参数照常）。"""
+    merged = _merge_traj_pair(new_action, old_action)
+    action = merged["actions"][0]
+    assert action["action"] == new_action["action"]
+    assert stale_key not in action
+    for key, value in new_action.items():
+        assert action[key] == value
+
+
+def test_merge_action_change_keeps_unknown_action_keys():
+    """动作变更只跳参数键：旧动作里的未知键仍深拷贝保留。"""
+    merged = _merge_traj_pair(
+        {"action": "click", "coordinate": [160, 310]},
+        {"action": "type", "coordinate": [150, 250],
+         "text": "abc", "foo": "bar"},
+    )
+    action = merged["actions"][0]
+    assert "text" not in action
+    assert action["foo"] == "bar"
+
+
+def test_merge_action_change_keeps_protected_fallback():
+    """动作变更时受保护字段空值回退规则不变（CoT/observation/element/status）。"""
+    merged = _merge_traj_pair(
+        {"action": "click", "coordinate": [160, 310], "element": ""},
+        {"action": "type", "coordinate": [150, 250], "text": "abc",
+         "element": "输入框", "status": "success"},
+    )
+    action = merged["actions"][0]
+    assert "text" not in action
+    assert action["element"] == "输入框"
+    assert action["status"] == "success"
+    assert merged["CoT"] == "下游已填的思维链"
+    assert merged["observation"]["active_window"] == "旧窗口"
+    assert merged["observation"]["ui_tree_segment"] == {"nodes": ["old"]}
+
+
+def test_merge_same_action_still_fills_missing_keys():
+    """同动作类型：缺失的参数键与未知键仍照常补齐（跳过只针对动作变更）。"""
+    merged = _merge_traj_pair(
+        {"action": "click", "element": ""},
+        {"action": "click", "coordinate": [1, 2], "foo": "bar"},
+    )
+    action = merged["actions"][0]
+    assert action["coordinate"] == [1, 2]
+    assert action["foo"] == "bar"
+
+    merged = _merge_traj_pair(
+        {"action": "type", "coordinate": [3, 4]},
+        {"action": "type", "coordinate": [3, 4], "text": "旧文本"},
+    )
+    assert merged["actions"][0]["text"] == "旧文本"
+
+
+def test_merge_answer_terminate_serialized_as_same_type():
+    """answer_terminate 序列化为 answer：旧 answer→新 answer 视为同类型。"""
+    merged = _merge_traj_pair(
+        {"action": "answer", "text": "新答案",
+         "element": "", "status": "success"},
+        {"action": "answer", "text": "旧答案", "ans_extra": 7},
+    )
+    action = merged["actions"][0]
+    assert action["text"] == "新答案"
+    assert action["status"] == "success"
+    assert action["ans_extra"] == 7
+
+    # 新 answer 缺 text 时旧值照常补齐（同类型行为不变）
+    merged = _merge_traj_pair(
+        {"action": "answer", "element": "", "status": "success"},
+        {"action": "answer", "text": "旧答案"},
+    )
+    assert merged["actions"][0]["text"] == "旧答案"
+
+
+@pytest.mark.parametrize("silent", [False, True], ids=["normal", "silent"])
+def test_save_edited_round_type_to_click_drops_stale_text(
+        tmp_path, qapp, modal, silent):
+    """端到端：type 步改为 click 保存后，交付 JSON 不得复活旧 text。"""
+    gui_dir, data, coords_entries = _build_dataset(tmp_path)
+    editor = _load_editor(tmp_path, gui_dir, data, coords_entries, round_index=0)
+    json_path = os.path.join(gui_dir, f"gui_{GUI_NUM}.json")
+    try:
+        editor.jump_to_step(1)
+        flush_events()
+        assert editor.steps_data[1]["action_data"]["action"] == "type"
+        assert editor.steps_data[1]["action_data"]["text"] == "abc"
+
+        # 动作改为 click 并给合法坐标（vertices 沿用原步载入的拉框）
+        editor.action_combo.setCurrentIndex(
+            editor.action_combo.findData("click"))
+        editor.coord_x_input.setText("160")
+        editor.coord_y_input.setText("310")
+        editor.confirm_step()
+        flush_events()
+
+        assert editor.save_edited_round(silent) is True
+        flush_events(50)
+    finally:
+        editor._edit_final_saved = True
+        try:
+            editor.close()
+        except Exception:
+            pass
+        flush_events(50)
+
+    saved = _read_json(json_path)
+    action = saved["messages"][1]["trajectory"][1]["actions"][0]
+    assert action["action"] == "click"
+    assert "text" not in action
+    assert action["coordinate"] == [160, 310]
+    # 未编辑轮不受影响
+    assert saved["messages"][3] == data["messages"][3]

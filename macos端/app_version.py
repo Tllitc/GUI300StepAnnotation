@@ -9,7 +9,7 @@
 import re
 
 # 语义化版本号：主版本号.次版本号.补丁号（与 main.spec 的 VERSION 对齐）
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 
 # NAS 挂载的发布目录（构建产物与 version.json 均发布于此）
 # 实际挂载点由部署方确认，build_release.py --publish-dir 可覆盖

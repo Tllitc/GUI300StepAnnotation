@@ -3874,6 +3874,12 @@ class AnnotationEditor(QMainWindow):
     _PROTECTED_STEP_KEYS = ("CoT",)
     _PROTECTED_OBSERVATION_KEYS = ("active_window", "ui_tree_segment")
     _PROTECTED_ACTION_KEYS = ("element", "status")
+    # 动作参数键：动作类型变更后，_build_action_data 已按新动作正确省略无关
+    # 参数，合并补齐不得把旧动作的这些键连同旧值复活进交付 JSON
+    _ACTION_PARAM_KEYS = {
+        "coordinate", "start_coordinate", "text", "keys",
+        "time", "pixels", "buttons",
+    }
 
     @staticmethod
     def _is_empty_protected_value(value):
@@ -3895,17 +3901,26 @@ class AnnotationEditor(QMainWindow):
         return True
 
     @classmethod
-    def _merge_missing_keys(cls, new, old, protected_keys=()):
+    def _merge_missing_keys(cls, new, old, protected_keys=(),
+                            skip_missing_keys=()):
         """字段级递归合并，返回新对象，不就地修改入参。
 
         - 受保护字段（protected_keys）：新值非空才覆盖，空值保留旧值；
         - 其余键：新结构缺失则深拷贝旧值；新旧同为 dict/list 时递归合并；
         - 其余情况以新值为准。
+        - skip_missing_keys：只作用于当前这一层的缺失键补齐，不向子 dict
+          （如 observation）的递归调用传播。actions 列表按位置合并时，若
+          新旧元素的动作类型（字典中已序列化的 action 值，answer_terminate
+          记为 answer，故 answer↔answer_terminate 视为同类型）不同，则以
+          _ACTION_PARAM_KEYS 传入：旧动作的参数键不再补进新动作；未知键
+          与受保护键的保留/回退规则不受影响。
         """
         if isinstance(new, dict) and isinstance(old, dict):
             merged = copy.deepcopy(new)
             for k, v in old.items():
                 if k not in merged:
+                    if k in skip_missing_keys:
+                        continue
                     merged[k] = copy.deepcopy(v)
                     continue
                 if cls._merge_protected_field(merged, k, v, protected_keys):
@@ -3925,8 +3940,16 @@ class AnnotationEditor(QMainWindow):
             for i, old_item in enumerate(old):
                 if i < len(merged):
                     # trajectory 的 list 只有 actions：动作元素按动作受保护键合并
+                    skip_missing = ()
+                    if (isinstance(merged[i], dict)
+                            and isinstance(old_item, dict)
+                            and "action" in merged[i] and "action" in old_item
+                            and merged[i].get("action") != old_item.get("action")):
+                        # 动作类型已变更：旧动作的参数键不得复活进新动作
+                        skip_missing = cls._ACTION_PARAM_KEYS
                     merged[i] = cls._merge_missing_keys(
-                        merged[i], old_item, cls._PROTECTED_ACTION_KEYS)
+                        merged[i], old_item, cls._PROTECTED_ACTION_KEYS,
+                        skip_missing_keys=skip_missing)
                 else:
                     merged.append(copy.deepcopy(old_item))
             return merged

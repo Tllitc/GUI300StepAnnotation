@@ -1051,3 +1051,314 @@ def test_empty_coords_file_exists_b41_preserved(editor, monkeypatch, capsys):
     assert os.path.exists(coords_path)
     with open(coords_path, "r", encoding="utf-8") as f:
         assert json.load(f) == []
+
+
+# ---------------------------------------------------------------------------
+# 动作类型变更时旧动作参数污染回归（_merge_step_with_original）
+#
+# 缺陷背景：编辑已完成任务等编辑路径中，用户把某步动作类型改掉后（如
+# type → left_click），get_data() 已按新动作正确省略无关参数，但合并函数
+# 对 actions[0] 内「旧动作有、新动作缺失」的键无条件深拷贝补齐，把旧动作
+# 参数键（text/keys/time/pixels/coordinate/start_coordinate）连同旧值复活
+# 进交付 JSON。修复后：动作类型变更时不补齐旧动作已知参数键，未知键仍保留，
+# 受保护字段空值回退 / 终止动作规则 / 同类型补齐等其余行为一律不变。
+# ---------------------------------------------------------------------------
+def _rebuilt_step(action, shot, intent="编辑后的意图"):
+    """模拟 StepEditorWidget.get_data() 重建出的步骤字典：只含表单字段，
+    CoT / active_window / ui_tree_segment 为空值，非终止动作不带 status。"""
+    return {
+        "step": 0,
+        "intent": intent,
+        "CoT": "",
+        "observation": {
+            "screenshot": shot,
+            "active_window": "",
+            "ui_tree_segment": "",
+        },
+        "actions": [action],
+    }
+
+
+def test_merge_type_to_left_click_drops_old_text(editor):
+    """type(含 text)→left_click：旧动作的 text 不得被补齐复活。"""
+    gui = editor.gui_number
+    shot = f"gui_{gui}_0001.png"
+    old_step = _rich_step(gui, shot, {
+        "action": "type",
+        "coordinate": [200, 300],
+        "text": "旧输入文本",
+        "element": "输入框",
+        "status": "success",
+    })
+    new_step = _rebuilt_step({
+        "action": "left_click",
+        "coordinate": [200, 300],
+        "element": "",
+    }, shot)
+
+    merged = editor._merge_step_with_original(new_step, old_step)
+    action = merged["actions"][0]
+    assert action["action"] == "left_click"
+    assert "text" not in action
+    assert action["coordinate"] == [200, 300]
+    # 非参数键的保留规则不受影响：element 空值回退、status 缺失补齐
+    assert action["element"] == "输入框"
+    assert action["status"] == "success"
+
+
+def test_merge_drag_to_left_click_drops_old_start_coordinate(editor):
+    """left_click_drag(含 start_coordinate)→left_click：起点坐标不得复活。"""
+    gui = editor.gui_number
+    shot = f"gui_{gui}_0001.png"
+    old_step = _rich_step(gui, shot, {
+        "action": "left_click_drag",
+        "start_coordinate": [25, 40],
+        "coordinate": [110, 130],
+        "element": "",
+        "status": "success",
+    })
+    new_step = _rebuilt_step({
+        "action": "left_click",
+        "coordinate": [110, 130],
+        "element": "",
+    }, shot)
+
+    merged = editor._merge_step_with_original(new_step, old_step)
+    action = merged["actions"][0]
+    assert action["action"] == "left_click"
+    assert "start_coordinate" not in action
+    assert action["coordinate"] == [110, 130]
+
+
+def test_merge_left_click_to_wait_drops_coordinate_keeps_new_time(editor):
+    """left_click(含 coordinate)→wait：旧坐标不得复活，新 time 保留。"""
+    gui = editor.gui_number
+    shot = f"gui_{gui}_0001.png"
+    old_step = _rich_step(gui, shot, {
+        "action": "left_click",
+        "coordinate": [200, 300],
+        "element": "按钮",
+        "status": "success",
+    })
+    new_step = _rebuilt_step({
+        "action": "wait",
+        "time": 1.5,
+        "element": "",
+    }, shot)
+
+    merged = editor._merge_step_with_original(new_step, old_step)
+    action = merged["actions"][0]
+    assert action["action"] == "wait"
+    assert "coordinate" not in action
+    assert action["time"] == 1.5
+
+
+def test_merge_scroll_to_left_click_drops_old_pixels(editor):
+    """scroll(含 pixels)→left_click：旧滚动像素不得复活。"""
+    gui = editor.gui_number
+    shot = f"gui_{gui}_0001.png"
+    old_step = _rich_step(gui, shot, {
+        "action": "scroll",
+        "coordinate": [152, 315],
+        "pixels": 300,
+        "element": "",
+        "status": "success",
+    })
+    new_step = _rebuilt_step({
+        "action": "left_click",
+        "coordinate": [152, 315],
+        "element": "",
+    }, shot)
+
+    merged = editor._merge_step_with_original(new_step, old_step)
+    action = merged["actions"][0]
+    assert action["action"] == "left_click"
+    assert "pixels" not in action
+    assert action["coordinate"] == [152, 315]
+
+
+def test_merge_key_to_left_click_drops_old_keys(editor):
+    """key(含 keys)→left_click：旧按键组合不得复活。"""
+    gui = editor.gui_number
+    shot = f"gui_{gui}_0001.png"
+    old_step = _rich_step(gui, shot, {
+        "action": "key",
+        "keys": ["ctrl", "c"],
+        "element": "",
+        "status": "success",
+    })
+    new_step = _rebuilt_step({
+        "action": "left_click",
+        "coordinate": [200, 300],
+        "element": "",
+    }, shot)
+
+    merged = editor._merge_step_with_original(new_step, old_step)
+    action = merged["actions"][0]
+    assert action["action"] == "left_click"
+    assert "keys" not in action
+
+
+def test_merge_action_change_keeps_unknown_action_key(editor):
+    """动作变更但旧动作含未知键 foo：未知键仍保留，已知参数键不补齐。"""
+    gui = editor.gui_number
+    shot = f"gui_{gui}_0001.png"
+    old_step = _rich_step(gui, shot, {
+        "action": "type",
+        "coordinate": [200, 300],
+        "text": "旧输入文本",
+        "foo": "bar",
+        "element": "",
+        "status": "success",
+    })
+    new_step = _rebuilt_step({
+        "action": "left_click",
+        "coordinate": [200, 300],
+        "element": "",
+    }, shot)
+
+    merged = editor._merge_step_with_original(new_step, old_step)
+    action = merged["actions"][0]
+    assert action["foo"] == "bar"
+    assert "text" not in action
+
+
+def test_merge_action_change_keeps_protected_empty_fallback(editor):
+    """动作变更时受保护字段空值回退规则不变：新值空 → 保留原值。"""
+    gui = editor.gui_number
+    shot = f"gui_{gui}_0001.png"
+    old_step = _rich_step(gui, shot, {
+        "action": "left_click",
+        "coordinate": [200, 300],
+        "element": "原始按钮",
+        "status": "success",
+    })
+    new_step = _rebuilt_step({
+        "action": "wait",
+        "time": 2.0,
+        "element": "",
+    }, shot)
+
+    merged = editor._merge_step_with_original(new_step, old_step)
+    action = merged["actions"][0]
+    # 步骤级 CoT / observation 级受保护字段：空值回退原值
+    assert merged["CoT"] == "原始推理链，禁止被空值覆盖"
+    assert merged["observation"]["active_window"] == "原始窗口标题"
+    assert merged["observation"]["ui_tree_segment"] == "<node>原始 UI 树片段</node>"
+    # 非终止动作 element/status：空值回退 / 缺失补齐
+    assert action["element"] == "原始按钮"
+    assert action["status"] == "success"
+    # 步骤级未知键照常保留
+    assert merged["downstream_meta"] == {"x": 1, "nested": ["a", "b"]}
+    # 但旧动作参数键不补齐
+    assert "coordinate" not in action
+    assert action["time"] == 2.0
+
+
+def test_merge_same_action_still_backfills_missing_keys(editor):
+    """同动作类型（left_click→left_click）：缺失的参数键与未知键仍照常补齐。"""
+    gui = editor.gui_number
+    shot = f"gui_{gui}_0001.png"
+    old_step = _rich_step(gui, shot, {
+        "action": "left_click",
+        "coordinate": [200, 300],
+        "foo": "bar",
+        "element": "按钮",
+        "status": "success",
+    })
+    new_step = _rebuilt_step({
+        "action": "left_click",
+        "element": "新按钮",
+    }, shot)
+
+    merged = editor._merge_step_with_original(new_step, old_step)
+    action = merged["actions"][0]
+    assert action["action"] == "left_click"
+    assert action["coordinate"] == [200, 300]
+    assert action["foo"] == "bar"
+    assert action["element"] == "新按钮"
+    assert action["status"] == "success"
+
+
+def test_merge_answer_same_serialized_type_backfills_text(editor):
+    """旧 answer(含 text)→新 answer（answer_terminate 序列化后同为 answer）：
+    视为同类型，text 等缺失键补齐行为不变，终止动作规则照常。"""
+    gui = editor.gui_number
+    shot = f"gui_{gui}_0001.png"
+    old_step = _rich_step(gui, shot, {
+        "action": "answer",
+        "text": "旧回答文本",
+        "element": "残留元素",
+        "status": "failed",
+    })
+    # get_data() 对 answer_terminate 的序列化产物：action="answer"、status="success"
+    new_step = _rebuilt_step({
+        "action": "answer",
+        "element": "",
+        "status": "success",
+    }, shot)
+
+    merged = editor._merge_step_with_original(new_step, old_step)
+    action = merged["actions"][0]
+    assert action["action"] == "answer"
+    assert action["text"] == "旧回答文本"
+    assert action["element"] == ""
+    assert action["status"] == "success"
+
+
+def test_edit_completed_change_type_to_click_confirm_then_save(editor):
+    """端到端：type 步改为 left_click，确认分支（save_current_step 编辑模式）
+    与非 silent 写回都不得把旧 text 带回交付 JSON。"""
+    gui = editor.gui_number
+    data, _shots = _single_round_data(gui, [
+        ("type", {"coordinate": [200, 300], "text": "旧输入文本", "element": "输入框"}),
+    ])
+    coords = [{"step": 0, "action": "type",
+               "vertices": [100, 200, 300, 400], "center": [200, 300]}]
+    _prepare_dataset(editor, data, coords)
+
+    ed = editor.steps[0]["editor"]
+    assert ed.action_type_combo.currentText() == "文本输入"
+    assert ed.text_input.toPlainText() == "旧输入文本"
+
+    # 通过编辑器控件改动作类型；坐标框只读，hydration 已回填 (200,300)
+    H.fill_step(editor, 0, action_chinese="左键单击", intent="改为点击",
+                coord_text="200,300")
+    # 文本框仍留着旧文本：get_data() 按新动作省略 text，污染只可能来自合并
+    assert ed.text_input.toPlainText() == "旧输入文本"
+
+    H.save_current(editor)  # save_current_step 编辑模式确认分支
+    confirmed_action = editor.steps[0]["data"]["actions"][0]
+    assert confirmed_action["action"] == "left_click"
+    assert "text" not in confirmed_action
+
+    assert editor.save_edited_round() is True
+
+    # ⚠ silent=False 保存成功后产品会 close() + deleteLater()：此处起不得再推进
+    # 事件循环，后续只读纯 Python / 磁盘
+    saved_action = H.read_final_json(editor)["messages"][1]["trajectory"][0]["actions"][0]
+    assert saved_action["action"] == "left_click"
+    assert "text" not in saved_action
+    assert saved_action["coordinate"] == [200, 300]
+    I.assert_final_json(editor, expected_rounds=1)
+
+
+def test_edit_completed_change_type_to_click_silent_writeback(editor):
+    """端到端：不经确认直接 silent 写回（关闭窗口路径），旧 text 同样不得复活。"""
+    gui = editor.gui_number
+    data, _shots = _single_round_data(gui, [
+        ("type", {"coordinate": [200, 300], "text": "旧输入文本", "element": "输入框"}),
+    ])
+    coords = [{"step": 0, "action": "type",
+               "vertices": [100, 200, 300, 400], "center": [200, 300]}]
+    _prepare_dataset(editor, data, coords)
+
+    H.fill_step(editor, 0, action_chinese="左键单击", intent="改为点击",
+                coord_text="200,300")
+    assert editor.save_edited_round(silent=True) is True
+
+    saved_action = H.read_final_json(editor)["messages"][1]["trajectory"][0]["actions"][0]
+    assert saved_action["action"] == "left_click"
+    assert "text" not in saved_action
+    assert saved_action["coordinate"] == [200, 300]
+    I.assert_final_json(editor, expected_rounds=1)
